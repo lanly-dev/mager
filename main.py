@@ -96,6 +96,139 @@ def seg_km(img, k, morph=5):
                      "cov": float(cnt[i]/tot), "kind": "lump",
                      "area": int(cnt[i]), "cx": -1, "cy": -1})
     return vis, info
+def _lab_means(work, lm, k):
+    lab = cv2.cvtColor(work, cv2.COLOR_RGB2LAB).astype(np.float32)
+    ms = []
+    for i in range(k):
+        m = (lm == i)
+        ms.append(lab[m].mean(axis=0) if m.any() else np.zeros(3, np.float32))
+    return np.stack(ms)
+
+def _lump_tex(gray, mask):
+    m = mask > 0
+    if not m.any():
+        return np.array([0.0, 0.0], np.float64)
+    px = gray[m].astype(np.float64)
+    gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+    edge = np.sqrt(gx * gx + gy * gy)[m].mean() / 255.0
+    return np.array([px.std() / 255.0, edge], np.float64)
+
+def seg_patterns(img, k, morph=7, min_area=400, merge=1.0):
+    h, w, _ = img.shape
+    k = max(2, min(int(k), 12))
+    work = cv2.bilateralFilter(img, 7, 60, 60)
+    gray = cv2.cvtColor(work, cv2.COLOR_RGB2GRAY)
+    sc = min(1.0, 320.0 / max(h, w))
+    small = cv2.resize(work, (int(w * sc), int(h * sc)), interpolation=cv2.INTER_AREA)
+    px = small.reshape(-1, 3).astype(np.float32)
+    crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
+    _, _, cent = cv2.kmeans(px, k, None, crit, 3, cv2.KMEANS_PP_CENTERS)
+    cent = cent.astype(np.uint8)
+    flat = work.reshape(-1, 3).astype(np.int16)
+    c = cent.astype(np.int16)
+    lab = np.empty(flat.shape[0], dtype=np.int32)
+    for i in range(0, flat.shape[0], 200000):
+        dd = np.linalg.norm(flat[i:i + 200000, None, :] - c[None, :, :], axis=2)
+        lab[i:i + 200000] = np.argmin(dd, axis=1)
+    lm = lab.reshape(h, w)
+    m = max(3, int(morph))
+    ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (m, m))
+    blobs = []
+    for ci in range(k):
+        msk = (lm == ci).astype(np.uint8) * 255
+        msk = cv2.morphologyEx(msk, cv2.MORPH_OPEN, ker)
+        msk = cv2.morphologyEx(msk, cv2.MORPH_CLOSE, ker)
+        n, cc, stats, c2 = cv2.connectedComponentsWithStats(msk, 8)
+        for j in range(1, n):
+            area = int(stats[j, cv2.CC_STAT_AREA])
+            if area < int(min_area):
+                continue
+            blobs.append((ci, (cc == j), area, int(c2[j][0]), int(c2[j][1])))
+    if not blobs:
+        return seg_km(img, k, morph=morph)
+    lmeans = _lab_means(work, lm, k)
+    feats = np.stack([_lump_tex(gray, b[1].astype(np.uint8) * 255) for b in blobs])
+    tcol = 28.0 / max(0.3, float(merge))
+    ttex = 0.35 / max(0.3, float(merge))
+    parent = list(range(len(blobs)))
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+    for a in range(len(blobs)):
+        for b in range(a + 1, len(blobs)):
+            dc = float(np.linalg.norm(lmeans[blobs[a][0]] - lmeans[blobs[b][0]]))
+            dt = float(np.linalg.norm(feats[a] - feats[b]))
+            if dc <= tcol and dt <= ttex:
+                ra, rb = find(a), find(b)
+                if ra != rb:
+                    parent[rb] = ra
+    groups = {}
+    for i in range(len(blobs)):
+        groups.setdefault(find(i), []).append(i)
+    ordered = sorted(groups.values(), key=lambda g: sum(blobs[i][2] for i in g), reverse=True)
+    return _paint_groups(img, blobs, cent, ordered, ker)
+def _paint_groups(img, blobs, cent, ordered, ker):
+    h, w, _ = img.shape
+    vis = np.zeros_like(img)
+    gid_map = np.full((h, w), -1, dtype=np.int32)
+    info = []
+    for gid, g in enumerate(ordered):
+        b, gg, r = PAL[gid % len(PAL)]
+        tot = 0
+        sx, sy = 0, 0
+        acc = np.zeros(3, np.float64)
+        for i in g:
+            ci, mask, area, cx, cy = blobs[i]
+            gid_map[mask] = gid
+            tot += area
+            sx += cx * area
+            sy += cy * area
+            acc += cent[ci].astype(np.float64) * area
+        mc = (acc / max(tot, 1)).astype(int)
+        vis[gid_map == gid] = (r, gg, b)
+        info.append({"id": gid, "mean": "#%02X%02X%02X" % (int(mc[0]), int(mc[1]), int(mc[2])),
+                     "cov": float(tot / (h * w)), "kind": "pattern",
+                     "area": int(tot), "cx": int(sx / max(tot, 1)),
+                     "cy": int(sy / max(tot, 1)), "parts": len(g)})
+    if (gid_map == -1).any():
+        filled = gid_map.copy()
+        masks = [(filled == o).astype(np.uint8) * 255 for o in range(len(ordered))]
+        while (filled == -1).any():
+            grown = False
+            for o in range(len(ordered)):
+                dil = cv2.dilate(masks[o], ker)
+                new = (dil > 0) & (filled == -1)
+                if new.any():
+                    filled[new] = o
+                    masks[o] = (filled == o).astype(np.uint8) * 255
+                    grown = True
+            if not grown:
+                filled[filled == -1] = 0
+                break
+        gid_map = filled
+        for o in range(len(ordered)):
+            b, gg, r = PAL[o % len(PAL)]
+            vis[gid_map == o] = (r, gg, b)
+    for o in range(len(ordered)):
+        m2 = (gid_map == o).astype(np.uint8) * 255
+        cnts, _ = cv2.findContours(m2, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(vis, cnts, -1, (255, 255, 255), 2)
+    for s in info:
+        cv2.putText(vis, str(s["id"]), (max(0, s["cx"] - 8), max(10, s["cy"] + 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(vis, str(s["id"]), (max(0, s["cx"] - 8), max(10, s["cy"] + 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+    cnt = np.bincount(gid_map.ravel(), minlength=len(ordered))
+    tot = max(cnt.sum(), 1)
+    for s in info:
+        s["cov"] = float(cnt[s["id"]] / tot)
+    SCAN["obj_map"] = gid_map
+    return vis, info
+def seg_nowrap_marker():  # placeholder replaced below
+    return None
 def seg_objects(img, k, morph=7, min_area=400):
     h, w, _ = img.shape
     k = max(2, min(int(k), 12))
@@ -239,6 +372,85 @@ def _empty_view():
     return ("<div style='color:#888;padding:20px;text-align:center'>"
             "Run <b>Scan Image</b> - tint + real map appear here, slider blends instantly.</div>")
 
+def _spotlight(vis, orig, gid, alpha=0.35):
+    if vis is None or orig is None:
+        return None
+    m = (SCAN.get("obj_map") == gid) if SCAN.get("obj_map") is not None else None
+    try:
+        a = max(0.0, min(1.0, float(alpha)))
+    except Exception:
+        a = 0.35
+    base = blend_overlay(vis, orig, a)
+    if m is None or not m.any():
+        return base
+    dark = (base.astype(np.float32) * 0.25).astype(np.uint8)
+    out = dark
+    out[m] = base[m]
+    cnts, _ = cv2.findContours(m.astype(np.uint8) * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(out, cnts, -1, (255, 255, 0), 2)
+    return out
+
+def _thumbs(vis, orig, info, size=160):
+    if vis is None or orig is None or not info:
+        return []
+    h, w, _ = vis.shape
+    sc = min(1.0, size / max(h, w))
+    nw, nh = max(1, int(w * sc)), max(1, int(h * sc))
+    om = SCAN.get("obj_map")
+    thumbs = []
+    for s in info:
+        gid = s["id"]
+        m = (om == gid) if om is not None else None
+        combo = np.hstack([cv2.resize(orig, (nw, nh), interpolation=cv2.INTER_AREA),
+                           cv2.resize(vis, (nw, nh), interpolation=cv2.INTER_NEAREST)])
+        if m is not None and m.any():
+            mm = cv2.resize(m.astype(np.uint8), (nw, nh), interpolation=cv2.INTER_NEAREST) > 0
+            left = combo[:, :nw].copy()
+            dark = (left.astype(np.float32) * 0.25).astype(np.uint8)
+            dark[mm] = left[mm]
+            cnts, _ = cv2.findContours(mm.astype(np.uint8) * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(dark, cnts, -1, (255, 255, 0), 1)
+            combo[:, :nw] = dark
+        thumbs.append((combo, "ID %d | real (spotlight) | tint" % gid))
+    return thumbs
+
+def _locate(gid_str, alpha=0.35):
+    if SCAN.get("vis") is None:
+        raise gr.Error("Run Scan first.")
+    try:
+        gid = int(float(str(gid_str)))
+    except Exception:
+        raise gr.Error("Pick a segment ID.")
+    return _spotlight(SCAN["vis"], SCAN.get("orig"), gid, alpha)
+
+def _swatch_popup(gid, hexcol, vis, orig, size=128):
+    om = SCAN.get("obj_map")
+    if om is not None:
+        m = (om == gid)
+        combo = np.hstack([orig, vis]) if orig.shape == vis.shape else vis
+        if m.any():
+            ys, xs = np.where(m)
+            y0, y1 = max(0, ys.min() - 4), min(combo.shape[0], ys.max() + 5)
+            x0, x1 = max(0, xs.min() - 4), min(orig.shape[1], xs.max() + 5)
+            crop = orig[y0:y1, x0:x1]
+            dark = (crop.astype(np.float32) * 0.3).astype(np.uint8)
+            mm = m[y0:y1, x0:x1]
+            dark[mm] = crop[mm]
+            cnts, _ = cv2.findContours(mm.astype(np.uint8) * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(dark, cnts, -1, (255, 255, 0), 1)
+            thumb = cv2.resize(dark, (size, size), interpolation=cv2.INTER_NEAREST)
+        else:
+            thumb = cv2.resize(orig, (size, size), interpolation=cv2.INTER_AREA)
+    else:
+        thumb = cv2.resize(orig if orig is not None else vis, (size, size), interpolation=cv2.INTER_AREA)
+    b64 = _to_b64(thumb)
+    return (
+        "<div class='swwrap' data-gid='" + str(gid) + "' data-thumb='" + b64 + "'"
+        " style='position:relative;display:inline-block'>"
+        "<div title='ID " + str(gid) + " - hover row for minimap' style='width:22px;height:22px;border-radius:4px;"
+        "border:1px solid #555;background:" + hexcol + ";cursor:zoom-in'></div>"
+        "</div>")
+
 def _blend_view(tint_b64, real_b64, alpha):
     try:
         a = max(0.0, min(1.0, float(alpha)))
@@ -253,11 +465,15 @@ def _blend_view(tint_b64, real_b64, alpha):
         "if(s&&lay){var f=function(){lay.style.opacity=(parseFloat(s.value)||0).toString();};"
         "s.addEventListener('input',f);f();}})();</script></div>")
 
-def f1_scan(image, k, mode, morph, min_area, alpha):
+def f1_scan(image, k, mode, morph, min_area, alpha, merge):
     image = norm_img(image)
     if image is None:
-        return _empty_view(), None, [], "Upload or paste an image first (upload / drag-drop / Ctrl+V)."
-    if str(mode).lower().startswith("object"):
+        return _empty_view(), [], \
+            "Upload or paste an image first (upload / drag-drop / Ctrl+V)."
+    ml = str(mode).lower()
+    if ml.startswith("pattern"):
+        vis, info = seg_patterns(image, int(k), morph=int(morph), min_area=int(min_area), merge=float(merge))
+    elif ml.startswith("object"):
         vis, info = seg_objects(image, int(k), morph=int(morph), min_area=int(min_area))
     else:
         vis, info = seg_km(image, int(k), morph=int(morph))
@@ -265,13 +481,14 @@ def f1_scan(image, k, mode, morph, min_area, alpha):
     rows = []
     for i, s in enumerate(info):
         pb = PAL[s["id"] % len(PAL)]
-        rows.append([s["id"], s["mean"], round(s["cov"]*100,2),
-                     NAMES[i % len(NAMES)], bgr_hex((int(pb[0]),int(pb[1]),int(pb[2]))), th[i]])
+        sw = _swatch_popup(s["id"], bgr_hex((int(pb[0]), int(pb[1]), int(pb[2]))), vis, image)
+        rows.append([s["id"], s["mean"], round(s["cov"] * 100, 2),
+                     NAMES[i % len(NAMES)], bgr_hex((int(pb[0]), int(pb[1]), int(pb[2]))), th[i], sw])
     SCAN["info"] = info
     SCAN["vis"] = vis
     SCAN["orig"] = image
     view = _blend_view(_to_b64(vis), _to_b64(image), alpha)
-    return view, rows, "Found %d segments (%s). Drag overlay slider - blends instantly." % (len(info), mode)
+    return view, rows, "Found %d segments (%s). Hover a swatch for its minimap popup." % (len(info), mode)
 
 def f1_export(table):
     # Gradio Dataframe arrives as pandas DataFrame -> convert to rows
@@ -288,7 +505,7 @@ def f1_export(table):
             vals = list(row)
         except Exception:
             continue
-        if len(vals) < 6:
+        if len(vals) < 7:
             continue
         # skip header row if present ("Segment ID", ...)
         if str(vals[0]).strip().lower() in ("segment id", "segment_id", "id", "s"):
@@ -429,10 +646,12 @@ def build_ui():
                     im = gr.Image(type="numpy", label="Upload or paste image (click to browse, drag-drop, or Ctrl+V)",
                                   sources=["upload", "clipboard"])
                     kk = gr.Slider(2, 12, value=5, step=1, label="Colors (K)")
-                    md = gr.Radio(["Object lumps", "Color lumps"], value="Object lumps",
+                    md = gr.Radio(["Pattern groups", "Object lumps", "Color lumps"], value="Pattern groups",
                         label="Segment mode")
                     mp = gr.Slider(3, 15, value=7, step=2, label="Cleanup size (bigger = more solid lumps)")
-                    ma = gr.Slider(0, 5000, value=400, step=50, label="Min object area px (object mode)")
+                    ma = gr.Slider(0, 5000, value=400, step=50, label="Min lump area px (pattern/object mode)")
+                    mg = gr.Slider(0.3, 3.0, value=1.0, step=0.1,
+                        label="Pattern merge strength (higher = fewer, bigger groups)")
                     sb = gr.Button("Scan Image", variant="primary")
                 with gr.Column():
                     so = gr.HTML(value=_empty_view(), label="Segmented (tint + real-map overlay)")
@@ -440,13 +659,58 @@ def build_ui():
                         label="Real-map overlay alpha (0 = pure tint, 1 = real map)",
                         elem_id="ovslider")
                     st = gr.Textbox(label="Status", interactive=False)
-            tb = gr.Dataframe(headers=["Segment ID","Mean Color","Pixel pct","Label","Display Color","Threshold"],
-                datatype=["number","str","number","str","str","number"],
-                col_count=(6,"fixed"), interactive=True, wrap=True, label="Segments")
+            tb = gr.Dataframe(headers=["Segment ID", "Mean Color", "Pixel pct", "Label", "Display Color", "Threshold", "Swatch"],
+                datatype=["number", "str", "number", "str", "str", "number", "html"],
+                col_count=(7, "fixed"), interactive=True, wrap=True, label="Segments (hover any row for spotlight minimap)",
+                elem_id="segtable")
             with gr.Row():
                 eb = gr.Button("Export resource_label.json", variant="primary")
                 jo = gr.File(label="resource_label.json")
-            sb.click(f1_scan, [im, kk, md, mp, ma, ov], [so, tb, st])
+            sb.click(f1_scan, [im, kk, md, mp, ma, ov, mg], [so, tb, st])
+            d.load(None, None, None, js="""() => {
+if (window.__segHover) return; window.__segHover = true;
+const css = document.createElement('style');
+css.textContent = '#segtable td{overflow:visible !important;} #segtable .table-wrap{overflow:visible !important;}' +
+' #rowtip{position:fixed;z-index:9999;display:none;pointer-events:none;background:#111;border:1px solid #666;border-radius:8px;padding:6px;}' +
+' #rowtip img{width:180px;height:180px;image-rendering:pixelated;display:block;}' +
+' #rowtip .cap{color:#eee;font-size:12px;margin-bottom:4px;}' +
+' #segtable tbody tr{transition:background 0.12s;} #segtable tbody tr.hlit{background:rgba(255,255,0,0.12) !important;}';
+document.head.appendChild(css);
+const tip = document.createElement('div'); tip.id = 'rowtip';
+tip.innerHTML = '<div class=cap></div><img/>';
+document.body.appendChild(tip);
+const timg = tip.querySelector('img'), tcap = tip.querySelector('.cap');
+const tbl = () => document.querySelector('#segtable');
+const idOf = (tr) => {
+  const sw = tr.querySelector('.swwrap');
+  if (sw && sw.dataset && sw.dataset.gid) return sw.dataset.gid;
+  const tds = tr.querySelectorAll('td');
+  if (tds.length) return (tds[0].innerText || '').trim();
+  return '';
+};
+const show = (tr, x, y) => {
+  const gid = idOf(tr);
+  const sw = tr.querySelector('.swwrap');
+  const src = sw ? sw.dataset.thumb : null;
+  if (!src) return;
+  tcap.textContent = 'ID ' + gid + ' spotlight (row hover)';
+  if (timg.src !== src) timg.src = src;
+  tip.style.display = 'block';
+  const pad = 16, W = 200, H = 230;
+  tip.style.left = Math.min(x + pad, window.innerWidth - W) + 'px';
+  tip.style.top = Math.min(y + pad, window.innerHeight - H) + 'px';
+};
+const hide = () => { tip.style.display = 'none'; };
+document.addEventListener('mousemove', e => {
+  const t = tbl(); if (!t) { hide(); return; }
+  const tr = e.target.closest ? e.target.closest('#segtable tbody tr') : null;
+  t.querySelectorAll('tbody tr.hlit').forEach(r => { if (r !== tr) r.classList.remove('hlit'); });
+  if (!tr) { hide(); return; }
+  tr.classList.add('hlit');
+  show(tr, e.clientX, e.clientY);
+});
+document.addEventListener('mouseleave', hide, true);
+}""")
             ov.input(None, [ov], None,
                 js="(a) => { var lay = document.getElementById('reallay');"
                    " if (lay) lay.style.opacity = (parseFloat(a) || 0).toString(); }")
