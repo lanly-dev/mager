@@ -1,6 +1,5 @@
-import json, os, random, tempfile, threading, time, webbrowser
+import json, os, random, threading, time, webbrowser
 from dataclasses import dataclass, asdict
-from typing import Dict
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw
@@ -106,7 +105,6 @@ def from_json(data):
             str(r.get("texture_png","") or "")))
     return out
 
-
 def _exemplars_from_payload(payload):
     """Decode {seg_id: exemplar RGB} carried by a resource_label.json payload."""
     out = {}
@@ -123,7 +121,6 @@ def _exemplars_from_payload(payload):
     except Exception:
         pass
     return out
-
 
 def _read_json_payload(jf):
     """Return (es, payload) from a JSON input.
@@ -152,7 +149,6 @@ def _b64_png(img):
     Image.fromarray(np.ascontiguousarray(img).astype(np.uint8)).save(buf, format="PNG")
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
-
 def _from_b64_png(s):
     """Decode a data-URL (or raw base64) PNG back to an RGB uint8 array. None on failure."""
     try:
@@ -166,7 +162,6 @@ def _from_b64_png(s):
         return np.array(im)
     except Exception:
         return None
-
 
 def _exemplar_crop(orig, label_map, gid, size=48):
     """Crop a size×size RGB exemplar of segment gid from the scanned reference image.
@@ -205,14 +200,12 @@ def _exemplar_crop(orig, label_map, gid, size=48):
     except Exception:
         return None
 
-
 def _exemplar_rgb(e):
     """Decode a Res material's embedded texture_png exemplar to RGB array. None on failure."""
     try:
         return _from_b64_png(getattr(e, "texture_png", ""))
     except Exception:
         return None
-
 
 def _scan_exemplars(size=48):
     """Build {seg_id: exemplar RGB array} from the last Feature 1 scan.
@@ -245,7 +238,6 @@ def _scan_exemplars(size=48):
             ex = np.full((size, size, 3), rgb, dtype=np.uint8)
         out[gid] = np.ascontiguousarray(ex)
     return out
-
 
 def _tile_texture(g, exemplars, es, seed=0, jitter=0):
     """Per-pixel texture for map grid g by tiling each segment's exemplar.
@@ -296,7 +288,6 @@ def _tile_texture(g, exemplars, es, seed=0, jitter=0):
         nz = rng.integers(-jit, jit + 1, size=tex.shape, dtype=np.int16)
         tex = np.clip(tex.astype(np.int16) + nz, 0, 255).astype(np.uint8)
     return tex
-
 
 def def_th(n):
     if n <= 1:
@@ -482,8 +473,6 @@ def _paint_groups(img, blobs, cent, ordered, ker):
         s["cov"] = float(cnt[s["id"]] / tot)
     SCAN["obj_map"] = gid_map
     return vis, info
-def seg_nowrap_marker():  # placeholder replaced below
-    return None
 def seg_objects(img, k, morph=7, min_area=400):
     h, w, _ = img.shape
     k = max(2, min(int(k), 12))
@@ -612,11 +601,6 @@ def blend_overlay(base, orig, alpha):
         orig = cv2.resize(orig, (base.shape[1], base.shape[0]), interpolation=cv2.INTER_AREA)
     return ((base.astype(np.float32)*(1.0-a) + orig.astype(np.float32)*a)).astype(np.uint8)
 
-def f1_overlay(alpha):
-    if SCAN.get("vis") is None:
-        raise gr.Error("Run Scan first.")
-    return blend_overlay(SCAN["vis"], SCAN.get("orig"), alpha)
-
 def _to_b64(img):
     import base64, io
     buf = io.BytesIO()
@@ -644,39 +628,6 @@ def _spotlight(vis, orig, gid, alpha=0.35):
     cnts, _ = cv2.findContours(m.astype(np.uint8) * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     cv2.drawContours(out, cnts, -1, (255, 255, 0), 2)
     return out
-
-def _thumbs(vis, orig, info, size=160):
-    if vis is None or orig is None or not info:
-        return []
-    h, w, _ = vis.shape
-    sc = min(1.0, size / max(h, w))
-    nw, nh = max(1, int(w * sc)), max(1, int(h * sc))
-    om = SCAN.get("obj_map")
-    thumbs = []
-    for s in info:
-        gid = s["id"]
-        m = (om == gid) if om is not None else None
-        combo = np.hstack([cv2.resize(orig, (nw, nh), interpolation=cv2.INTER_AREA),
-                           cv2.resize(vis, (nw, nh), interpolation=cv2.INTER_NEAREST)])
-        if m is not None and m.any():
-            mm = cv2.resize(m.astype(np.uint8), (nw, nh), interpolation=cv2.INTER_NEAREST) > 0
-            left = combo[:, :nw].copy()
-            dark = (left.astype(np.float32) * 0.25).astype(np.uint8)
-            dark[mm] = left[mm]
-            cnts, _ = cv2.findContours(mm.astype(np.uint8) * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            cv2.drawContours(dark, cnts, -1, (255, 255, 0), 1)
-            combo[:, :nw] = dark
-        thumbs.append((combo, "ID %d | real (spotlight) | tint" % gid))
-    return thumbs
-
-def _locate(gid_str, alpha=0.35):
-    if SCAN.get("vis") is None:
-        raise gr.Error("Run Scan first.")
-    try:
-        gid = int(float(str(gid_str)))
-    except Exception:
-        raise gr.Error("Pick a segment ID.")
-    return _spotlight(SCAN["vis"], SCAN.get("orig"), gid, alpha)
 
 def _swatch_popup(gid, hexcol, vis, orig, size=128):
     om = SCAN.get("obj_map")
@@ -785,25 +736,6 @@ def _ask_save_path(start_name):
     except Exception:
         return ""
 
-def _export_then_save(start_name, write_file, kind):
-    """Chooser FIRST, then write only once.
-
-    - User picks destination -> bytes go straight there (single write).
-    - Dialog cancelled/unavailable -> fall back to .\\exports\\ backup copy."""
-    dest = _ask_save_path(start_name)
-    if dest:
-        try:
-            write_file(dest)
-            return "OK - %s\nSaved: %s" % (kind, dest)
-        except Exception as e:
-            raise gr.Error("Could not save to %s: %s" % (dest, e))
-    import datetime
-    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    base, ext = os.path.splitext(start_name)
-    p = _save_export("%s_%s%s" % (base, stamp, ext), write_file)
-    return ("OK - %s\nSaved (dialog cancelled/unavailable): %s\n"
-            "(File is in .\\exports\\, use Reveal button.)" % (kind, p))
-
 def _webview_save(src, start_name):
     """Ask pywebview for a native Save-As path and copy src there.
 
@@ -838,13 +770,6 @@ def _webview_save(src, start_name):
         return dest
     except Exception:
         return ""
-
-def _export_done_msg(src, start_name, kind):
-    dest = _webview_save(src, start_name)
-    if dest:
-        return "OK - %s\nSaved: %s" % (kind, dest)
-    return ("OK - %s\nSaved: %s\n(Save-As dialog unavailable - file is in .\\exports\\, "
-            "use Reveal button.)" % (kind, src))
 
 def f1_export(table):
     # Gradio Dataframe arrives as pandas DataFrame -> convert to rows
@@ -992,7 +917,6 @@ def _texture_grid(g, es):
             rgb = (128, 128, 128)
         tex[g == k] = rgb
     return tex
-
 
 def drawmap(g, es, ps, base_idx=None, resources=None, texture=None):
     h, w = g.shape
