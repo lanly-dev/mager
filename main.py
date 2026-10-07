@@ -70,7 +70,9 @@ def set_export_dir(path):
 PAL = [(41,171,226),(67,175,105),(237,185,27),(155,89,182),(231,76,60),(52,73,94),(26,188,156),(243,156,18),(211,84,0),(127,140,141),(44,62,80),(192,57,43)]
 NAMES = ["Water","Forest","Sand","Mountain","Grass","Rock","Snow","Swamp","Road","Urban","Farm","Lava"]
 SCAN = {}
-GEN = {"entries": None, "grid": None, "seed": None}
+GEN = {"entries": None, "grid": None, "seed": None, "height": None,
+       "base_idx": None, "resources": None, "texture": None}
+SWAP = {"orig": None, "out": None, "prev": [], "remaps": [], "entries": None}
 
 def bgr_hex(b):
     bb, gg, rr = (int(x) for x in b)
@@ -200,6 +202,14 @@ def _exemplar_crop(orig, label_map, gid, size=48):
         if crop.shape[0] != size or crop.shape[1] != size:
             crop = cv2.resize(crop, (size, size), interpolation=cv2.INTER_AREA)
         return np.ascontiguousarray(crop)
+    except Exception:
+        return None
+
+
+def _exemplar_rgb(e):
+    """Decode a Res material's embedded texture_png exemplar to RGB array. None on failure."""
+    try:
+        return _from_b64_png(getattr(e, "texture_png", ""))
     except Exception:
         return None
 
@@ -1141,7 +1151,8 @@ def f2_generate(jf, w, h, sc, oc, sd, ps, n_bases=1, n_res=2):
             texture = _tile_texture(g, exemplars, es, seed=int(sd))
         else:
             texture = _texture_grid(g, es)
-    GEN.update({"grid": g, "base_idx": base_idx, "resources": resources, "seed": int(sd), "texture": texture})
+    GEN.update({"grid": g, "height": nz, "base_idx": base_idx, "resources": resources,
+                "seed": int(sd), "texture": texture})
     im = add_legend(drawmap(g, es, int(ps), base_idx=base_idx, resources=resources, texture=texture), es, g,
                     base_idx=base_idx, resources=resources)
     cnt = np.bincount(g.ravel(), minlength=len(es))
@@ -1194,6 +1205,169 @@ def f2_mat():
     return _export_auto("generated_map_matrix.json",
                         lambda p: open(p, "w", encoding="utf-8").write(json.dumps(pay)),
                         "Grid JSON exported.")
+
+# ---------- feature 3: texture & material swap engine ----------
+def _swap_mask(img_rgb, target_hex, tol):
+    try:
+        tr, tg, tb = hex_rgb(target_hex)
+    except Exception:
+        tr, tg, tb = (128, 128, 128)
+    d = np.sqrt(((img_rgb.astype(np.float32) - np.array([tr, tg, tb], np.float32)) ** 2).sum(-1))
+    m = np.clip(1.0 - d / max(float(tol), 1.0), 0.0, 1.0)
+    return (m * 255.0 + 0.5).astype(np.uint8)
+
+def _resample_exemplar(tex, W, H, tile=1.0, seed=0):
+    t = np.asarray(tex, dtype=np.uint8)
+    if t.ndim != 3 or t.size == 0:
+        return np.zeros((H, W, 3), np.uint8)
+    th, tw = t.shape[:2]
+    sc = max(float(tile), 0.05)
+    nw, nh = max(1, int(round(tw * sc))), max(1, int(round(th * sc)))
+    t = np.asarray(Image.fromarray(t[:, :, :3], "RGB").resize((nw, nh), Image.BICUBIC), np.uint8)
+    th, tw = t.shape[:2]
+    oy, ox = (int(seed * 13) % max(th, 1)), (int(seed * 29) % max(tw, 1))
+    yy, xx = np.mgrid[0:H, 0:W]
+    return t[(yy + oy) % th, (xx + ox) % tw]
+
+def _mask_blend(base_rgb, tex_rgb, mask_u8, feather=1, strength=1.0):
+    m = mask_u8.astype(np.float32) / 255.0
+    if feather > 0:
+        k = int(feather) * 2 + 1
+        m = cv2.GaussianBlur(m, (k, k), 0)
+    m = np.clip(m * float(strength), 0.0, 1.0)[..., None]
+    return (base_rgb.astype(np.float32) * (1.0 - m)
+            + tex_rgb.astype(np.float32) * m + 0.5).astype(np.uint8)
+
+def f3_upload(img, jf):
+    if img is None:
+        raise gr.Error("Upload a map image first.")
+    rgb = np.asarray(Image.fromarray(
+        img.astype(np.uint8) if isinstance(img, np.ndarray) else img).convert("RGB"), np.uint8)
+    es = None
+    if jf is not None:
+        try:
+            es, _ = _read_json_payload(jf)
+        except Exception:
+            es = None
+    if es is None:
+        es = GEN.get("entries") or SCAN.get("entries")
+    if not es:
+        raise gr.Error("Load a resource_label.json too (upload it here, or Scan/Generate first).")
+    SWAP.update(orig=rgb, out=rgb.copy(), prev=[], remaps=[], entries=es)
+    names = ["%d:%s" % (e.id, e.label) for e in es]
+    return (Image.fromarray(rgb, "RGB"), gr.update(choices=names, value=[]),
+            gr.update(choices=names, value=names[0] if names else None),
+            "Loaded %dx%d + %d materials." % (rgb.shape[1], rgb.shape[0], len(es)))
+
+def f3_apply(targets, repl, tol=90.0, feather=1, strength=1.0, tile=1.0):
+    if SWAP.get("orig") is None:
+        raise gr.Error("Upload a map image first (Feature 3).")
+    es = SWAP.get("entries") or GEN.get("entries") or SCAN.get("entries")
+    if not es:
+        raise gr.Error("No materials loaded.")
+    if not targets:
+        raise gr.Error("Pick at least one target material.")
+    try:
+        rid = int(str(repl).split(":")[0])
+    except Exception:
+        raise gr.Error("Pick a replacement texture.")
+    src = next((e for e in es if e.id == rid), None)
+    if src is None:
+        raise gr.Error("Replacement material not found.")
+    tex = _exemplar_rgb(src)
+    if tex is None:
+        tex = np.full((48, 48, 3), hex_rgb(src.color_hex), np.uint8)
+    base = SWAP.get("out", SWAP["orig"]).copy()
+    H, W = base.shape[:2]
+    layer = _resample_exemplar(tex, W, H, tile=tile, seed=rid)
+    tids = []
+    for t in targets:
+        try:
+            tids.append(int(str(t).split(":")[0]))
+        except Exception:
+            pass
+    combined = np.zeros((H, W), np.uint8)
+    for tid in tids:
+        tgt = next((e for e in es if e.id == tid), None)
+        if tgt is None:
+            continue
+        combined = np.maximum(combined, _swap_mask(base, tgt.color_hex, tol))
+    if int(combined.max()) == 0:
+        return Image.fromarray(base, "RGB"), "No pixels matched (raise tolerance)."
+    SWAP.setdefault("prev", []).append(base.copy())
+    out = _mask_blend(base, layer, combined, feather=int(feather), strength=strength)
+    SWAP["out"] = out
+    SWAP.setdefault("remaps", []).append({"targets": tids, "replacement": rid})
+    cov = 100.0 * (combined > 0).sum() / combined.size
+    return Image.fromarray(out, "RGB"), "Swapped %s -> %s : %.1f%% pixels." % (
+        ",".join(str(i) for i in tids), src.label, cov)
+
+def f3_undo():
+    if SWAP.get("prev"):
+        SWAP["out"] = SWAP["prev"].pop()
+        if SWAP.get("remaps"):
+            SWAP["remaps"].pop()
+        return Image.fromarray(SWAP["out"], "RGB"), "Undid last swap."
+    if SWAP.get("orig") is not None:
+        SWAP["out"] = SWAP["orig"].copy()
+        SWAP["remaps"] = []
+        return Image.fromarray(SWAP["out"], "RGB"), "Reset to original."
+    raise gr.Error("Nothing to undo.")
+
+def f3_save():
+    if SWAP.get("out") is None:
+        raise gr.Error("Nothing to save yet.")
+    d = get_export_dir()
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    p = os.path.join(d, "swapped_map_%s.png" % ts)
+    Image.fromarray(SWAP["out"], "RGB").save(p)
+    jp = os.path.join(d, "swapped_remaps_%s.json" % ts)
+    with open(jp, "w", encoding="utf-8") as f:
+        json.dump({"meta": {"app": "MAGER", "version": 1}, "remaps": SWAP.get("remaps", [])}, f, indent=2)
+    return "Saved:\n" + _rel(p) + "\n" + _rel(jp)
+
+# ---------- feature 4: generic game map exporter ----------
+def f4_export(fmt):
+    g = GEN.get("grid")
+    if g is None:
+        raise gr.Error("Generate a map first (Feature 2).")
+    es = GEN.get("entries") or []
+    nz = GEN.get("height")
+    if nz is None:
+        nz = np.full_like(g, 0.5, dtype=np.float32)
+    d = get_export_dir()
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    outs = []
+    if "a) 2D grid matrix JSON" in fmt:
+        p = os.path.join(d, "export_grid_%s.json" % ts)
+        payload = {"meta": {"app": "MAGER", "version": 1, "kind": "grid_matrix",
+                            "seed": GEN.get("seed"), "w": int(g.shape[1]), "h": int(g.shape[0])},
+                   "materials": [{"id": e.id, "label": e.label} for e in es],
+                   "grid": g.astype(int).tolist()}
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        outs.append(p)
+    if "b) 16-bit heightmap PNG" in fmt:
+        p = os.path.join(d, "export_height_%s.png" % ts)
+        cv2.imwrite(p, (np.clip(nz, 0, 1) * 65535.0 + 0.5).astype(np.uint16))
+        outs.append(p)
+    if "c) RGBA splatmap PNG" in fmt:
+        p = os.path.join(d, "export_splat_%s.png" % ts)
+        k = min(4, len(es))
+        spl = np.zeros((g.shape[0], g.shape[1], 4), np.uint8)
+        for i in range(k):
+            spl[:, :, i] = np.where(g == i, 255, 0).astype(np.uint8)
+        Image.fromarray(spl, "RGBA").save(p)
+        outs.append(p)
+    if "d) object/resource placement JSON" in fmt:
+        p = os.path.join(d, "export_objects_%s.json" % ts)
+        objs = [{"id": int(b), "x": int(x), "y": int(y)} for (b, x, y) in (GEN.get("resources") or [])]
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"meta": {"app": "MAGER", "version": 1}, "objects": objs}, f, indent=2)
+        outs.append(p)
+    if not outs:
+        raise gr.Error("Tick at least one export format.")
+    return "Exported:\n" + "\n".join(_rel(p) for p in outs)
 
 def _reveal_exports():
     p = os.path.abspath(get_export_dir())
@@ -1319,6 +1493,39 @@ document.addEventListener('mouseleave', hide, true);
             pb.click(f2_png, None, [po])
             mb.click(f2_mat, None, [mo2])
             reveal2.click(_reveal_exports, None, [mo2])
+        with gr.Tab("🎨 Feature 3 - Texture Swap"):
+            gr.Markdown("Upload an existing map, pick target material(s) + replacement texture. "
+                        "Mask-based OpenCV blend layers re-texture only matched pixels - geometry is preserved.")
+            with gr.Row():
+                sw_img = gr.Image(label="Existing map image", type="numpy")
+                sw_json = gr.File(label="resource_label.json (or reuse Scan/Generate)", file_types=[".json"])
+            sw_load = gr.Button("Load map + materials", variant="primary")
+            sw_targets = gr.CheckboxGroup(label="Target materials to replace (masks)", choices=[], value=[])
+            sw_repl = gr.Dropdown(label="Replacement texture (material exemplar)", choices=[], value=None)
+            with gr.Row():
+                sw_tol = gr.Slider(10, 250, value=90, step=1, label="Colour tolerance")
+                sw_feather = gr.Slider(0, 8, value=1, step=1, label="Edge feather")
+                sw_strength = gr.Slider(0.1, 1.0, value=1.0, step=0.05, label="Blend strength")
+                sw_tile = gr.Slider(0.25, 4.0, value=1.0, step=0.25, label="Texture scale")
+            with gr.Row():
+                sw_apply = gr.Button("Apply swap", variant="primary")
+                sw_undo = gr.Button("Undo / Reset")
+                sw_save = gr.Button("Save result")
+            sw_out = gr.Image(label="Re-textured result")
+            sw_msg = gr.Textbox(label="Swap log")
+            sw_load.click(f3_upload, [sw_img, sw_json], [sw_out, sw_targets, sw_repl, sw_msg])
+            sw_apply.click(f3_apply, [sw_targets, sw_repl, sw_tol, sw_feather, sw_strength, sw_tile], [sw_out, sw_msg])
+            sw_undo.click(f3_undo, [], [sw_out, sw_msg])
+            sw_save.click(f3_save, [], [sw_msg])
+        with gr.Tab("📦 Feature 4 - Game Exporter"):
+            gr.Markdown("Derives engine-ready files from the last Feature 2 generation.")
+            ex_fmt = gr.CheckboxGroup(label="Export formats",
+                choices=["a) 2D grid matrix JSON", "b) 16-bit heightmap PNG",
+                         "c) RGBA splatmap PNG", "d) object/resource placement JSON"],
+                value=["a) 2D grid matrix JSON"])
+            ex_btn = gr.Button("Export selected", variant="primary")
+            ex_msg = gr.Textbox(label="Export log")
+            ex_btn.click(f4_export, [ex_fmt], [ex_msg])
         with gr.Tab("⚙ Settings"):
             gr.Markdown("### Export folder\nAll Save buttons write here automatically. "
                         "Pick a folder once - it is remembered in `settings.json`.")
