@@ -9,6 +9,64 @@ import gradio as gr
 
 APP_TITLE = "MAGER - Procedural Map Studio"
 GRADIO_PORT = 7869
+HERE = os.path.dirname(os.path.abspath(__file__))
+SETTINGS_PATH = os.path.join(HERE, "settings.json")
+DEFAULT_EXPORT_DIR = os.path.join(HERE, "exports")
+
+def _rel(p):
+    """Display path relative to the app folder so the user's local
+    path (C:\\Users\\...) is never shown. Falls back to the input
+    when the path lives outside the app folder."""
+    try:
+        rel = os.path.relpath(os.path.abspath(p), HERE)
+        if not rel.startswith(".."):
+            return rel
+    except Exception:
+        pass
+    return p
+
+def _load_settings():
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_settings(s):
+    try:
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(s, f, indent=2)
+    except Exception:
+        pass
+
+def get_export_dir():
+    d = (_load_settings().get("export_dir") or "").strip() or DEFAULT_EXPORT_DIR
+    if not os.path.isabs(d):
+        d = os.path.join(HERE, d)  # relative value in settings.json
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        d = DEFAULT_EXPORT_DIR
+        os.makedirs(d, exist_ok=True)
+    return d
+
+def set_export_dir(path):
+    path = (path or "").strip()
+    if not path:
+        raise gr.Error("Pick a folder first (Browse...).")
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception as e:
+        raise gr.Error("Cannot use folder %s: %s" % (path, e))
+    s = _load_settings()
+    # store relative when inside the app folder (no local path on disk)
+    try:
+        rel = os.path.relpath(os.path.abspath(path), HERE)
+        s["export_dir"] = rel if not rel.startswith("..") else os.path.abspath(path)
+    except Exception:
+        s["export_dir"] = os.path.abspath(path)
+    _save_settings(s)
+    return "Export folder:\n" + _rel(path)
 PAL = [(41,171,226),(67,175,105),(237,185,27),(155,89,182),(231,76,60),(52,73,94),(26,188,156),(243,156,18),(211,84,0),(127,140,141),(44,62,80),(192,57,43)]
 NAMES = ["Water","Forest","Sand","Mountain","Grass","Rock","Snow","Swamp","Road","Urban","Farm","Lava"]
 SCAN = {}
@@ -37,12 +95,33 @@ def to_json(es):
 
 def from_json(data):
     out = []
-    for r in data.get("resources", []):
+    for r in data.get("resources") or data.get("materials") or []:
         out.append(Res(int(r["id"]), str(r.get("label","seg")),
             str(r.get("color_hex","#808080")),
             str(r.get("mean_color_hex","#808080")),
             float(r.get("coverage",0)), float(r.get("threshold",0))))
     return out
+
+
+def _read_json_payload(jf):
+    """Return (es, payload) from a JSON input.
+
+    es is a list of Res (empty if the JSON holds no readable resources).
+    payload is the raw parsed dict, which may carry a 'texture' field that
+    Feature 2 can render from instead of only deriving colours from materials.
+    """
+    try:
+        if jf is None or (isinstance(jf, str) and not jf.strip()):
+            return [], None
+        if hasattr(jf, "read"):  # file-like object
+            data = json.load(jf)
+        else:
+            with open(jf, "r", encoding="utf-8") as f:
+                data = json.load(f)
+    except Exception:
+        return [], None
+    es = from_json(data)
+    return es, data
 
 def def_th(n):
     if n <= 1:
@@ -490,6 +569,107 @@ def f1_scan(image, k, mode, morph, min_area, alpha, merge):
     view = _blend_view(_to_b64(vis), _to_b64(image), alpha)
     return view, rows, "Found %d segments (%s). Hover a swatch for its minimap popup." % (len(info), mode)
 
+def _save_export(name, write):
+    p = os.path.join(get_export_dir(), name)
+    write(p)
+    return p
+
+def _export_auto(name, write_file, kind):
+    """Save straight to the configured export folder. No dialogs."""
+    import datetime
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    base, ext = os.path.splitext(name)
+    p = _save_export("%s_%s%s" % (base, stamp, ext), write_file)
+    return "OK - %s\nSaved: %s" % (kind, _rel(p))
+
+def _ask_save_path(start_name):
+    """Show native Save-As first, return chosen path or ''.
+
+    Runs in a worker thread with a timeout so a blocked/cancelled
+    dialog can never hang the Gradio server thread."""
+    import concurrent.futures
+
+    def _ask():
+        try:
+            import webview
+            wins = getattr(webview, "windows", None) or []
+            if not wins:
+                return ""
+            res = wins[0].create_file_dialog(webview.SAVE_DIALOG,
+                                             save_filename=start_name)
+            if not res:
+                return ""
+            return res[0] if isinstance(res, (list, tuple)) else res
+        except Exception:
+            return ""
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            return ex.submit(_ask).result(timeout=120) or ""
+    except Exception:
+        return ""
+
+def _export_then_save(start_name, write_file, kind):
+    """Chooser FIRST, then write only once.
+
+    - User picks destination -> bytes go straight there (single write).
+    - Dialog cancelled/unavailable -> fall back to .\\exports\\ backup copy."""
+    dest = _ask_save_path(start_name)
+    if dest:
+        try:
+            write_file(dest)
+            return "OK - %s\nSaved: %s" % (kind, dest)
+        except Exception as e:
+            raise gr.Error("Could not save to %s: %s" % (dest, e))
+    import datetime
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    base, ext = os.path.splitext(start_name)
+    p = _save_export("%s_%s%s" % (base, stamp, ext), write_file)
+    return ("OK - %s\nSaved (dialog cancelled/unavailable): %s\n"
+            "(File is in .\\exports\\, use Reveal button.)" % (kind, p))
+
+def _webview_save(src, start_name):
+    """Ask pywebview for a native Save-As path and copy src there.
+
+    Runs the dialog in a STA thread with a timeout so a blocked/cancelled
+    dialog can never hang the Gradio server thread. Returns dest or ''."""
+    import shutil
+    import concurrent.futures
+
+    def _ask():
+        try:
+            import webview
+            wins = getattr(webview, "windows", None) or []
+            if not wins:
+                return ""
+            res = wins[0].create_file_dialog(webview.SAVE_DIALOG,
+                                             save_filename=start_name)
+            if not res:
+                return ""
+            return res[0] if isinstance(res, (list, tuple)) else res
+        except Exception:
+            return ""
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            dest = ex.submit(_ask).result(timeout=120)
+    except Exception:
+        return ""
+    if not dest:
+        return ""
+    try:
+        shutil.copyfile(src, dest)
+        return dest
+    except Exception:
+        return ""
+
+def _export_done_msg(src, start_name, kind):
+    dest = _webview_save(src, start_name)
+    if dest:
+        return "OK - %s\nSaved: %s" % (kind, dest)
+    return ("OK - %s\nSaved: %s\n(Save-As dialog unavailable - file is in .\\exports\\, "
+            "use Reveal button.)" % (kind, src))
+
 def f1_export(table):
     # Gradio Dataframe arrives as pandas DataFrame -> convert to rows
     if table is not None and hasattr(table, "values"):
@@ -523,15 +703,14 @@ def f1_export(table):
     if not es:
         raise gr.Error("No valid rows. Run Scan first.")
     pay = to_json(es)
-    fd, p = tempfile.mkstemp(prefix="resource_label_", suffix=".json")
-    os.close(fd)
-    open(p,"w",encoding="utf-8").write(json.dumps(pay, indent=2))
+    def _write(p):
+        open(p, "w", encoding="utf-8").write(json.dumps(pay, indent=2))
     try:
         hp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resource_label.json")
         open(hp,"w",encoding="utf-8").write(json.dumps(pay, indent=2))
     except Exception:
         pass
-    return p
+    return _export_auto("resource_label.json", _write, "resource_label.json exported.")
 def load_entries(fobj):
     dflt = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resource_label.json")
     p = fobj if fobj else (dflt if os.path.exists(dflt) else None)
@@ -557,27 +736,127 @@ def pfield(w, h, scale, octv, seed):
         return (f-mn)/(mx-mn)
     return np.full_like(f, 0.5)
 
-def domap(nz, es):
+def domap(nz, es, base_field=None, n_bases=1, min_base_dist=30):
     order = sorted(range(len(es)), key=lambda k: es[k].threshold, reverse=True)
     g = np.full(nz.shape, order[-1], dtype=np.int32)
-    for k in order:
+    for k in reversed(order):
         g[nz >= es[k].threshold] = k
-    return g
 
-def drawmap(g, es, ps):
-    cv = np.zeros((g.shape[0], g.shape[1], 3), dtype=np.uint8)
+    base_idx = np.full(nz.shape, -1, dtype=np.int32)
+
+    if base_field is not None and n_bases > 0:
+        h, w = base_field.shape
+        flat_idx = np.argsort(base_field.ravel())[::-1]
+        placed = 0
+        for idx in flat_idx:
+            if placed >= n_bases:
+                break
+            x, y = idx % w, idx // w
+            if placed == 0:
+                base_idx[y, x] = placed
+                placed += 1
+            else:
+                # greedy: skip cells too close to existing bases
+                existed = np.column_stack(np.where(base_idx >= 0))
+                if len(existed) == 0:
+                    continue
+                dists = np.sqrt((existed[:, 1] - x) ** 2 + (existed[:, 0] - y) ** 2)
+                if dists.min() >= min_base_dist:
+                    base_idx[y, x] = placed
+                    placed += 1
+    return g, base_idx
+
+def place_resources(base_idx, res_field, n_res, radius=10):
+    h, w = res_field.shape
+    bases = np.unique(base_idx)
+    resources = []
+    for base_id in bases:
+        if base_id == -1:
+            continue
+        mask = base_idx == base_id
+        ys, xs = np.where(mask)
+        if len(ys) == 0:
+            continue
+        cy, cx = int(ys.mean()), int(xs.mean())
+        candidates = []
+        for yy in range(max(0, cy-radius), min(h, cy+radius+1)):
+            for xx in range(max(0, cx-radius), min(w, cx+radius+1)):
+                candidates.append((res_field[yy, xx], yy, xx))
+        candidates.sort(key=lambda t: t[0], reverse=True)
+        count = 0
+        for _, yy, xx in candidates:
+            if count >= n_res:
+                break
+            resources.append((int(base_id), int(xx), int(yy)))
+            count += 1
+    return resources
+
+def _texture_grid(g, es):
+    """Per-cell RGB texture (H x W x 3 uint8) the generator renders from.
+
+    One real pixel colour per map cell, derived from the material table,
+    instead of a flat fill colour.
+    """
+    h, w = g.shape
+    tex = np.zeros((h, w, 3), dtype=np.uint8)
     for k, e in enumerate(es):
         try:
             rgb = hex_rgb(e.color_hex)
         except Exception:
-            rgb = (128,128,128)
-        cv[g==k] = rgb
+            rgb = (128, 128, 128)
+        tex[g == k] = rgb
+    return tex
+
+
+def drawmap(g, es, ps, base_idx=None, resources=None, texture=None):
+    h, w = g.shape
+    if texture is not None:
+        cv = np.asarray(texture, dtype=np.uint8).copy()
+    else:
+        cv = np.zeros((h, w, 3), dtype=np.uint8)
+        for k, e in enumerate(es):
+            try:
+                rgb = hex_rgb(e.color_hex)
+            except Exception:
+                rgb = (128,128,128)
+            cv[g==k] = rgb
+
+    # Base markers
+    if base_idx is not None:
+        for base_id in np.unique(base_idx):
+            if base_id == -1:
+                continue
+            mask = base_idx == base_id
+            ys, xs = np.where(mask)
+            if len(ys) == 0:
+                continue
+            cy, cx = int(ys.mean()), int(xs.mean())
+            # Base marker: colored wedge on the base cell
+            col = PAL[base_id % len(PAL)]
+            for dy in range(-3, 4):
+                for dx in range(-3, 4):
+                    if abs(dx) != abs(dy) and abs(dx) + abs(dy) <= 3:
+                        ny, nx = cy+dy, cx+dx
+                        if 0 <= ny < cv.shape[0] and 0 <= nx < cv.shape[1]:
+                            cv[ny, nx] = col
+
+    # Resource markers
+    if resources:
+        for base_id, rx, ry in resources:
+            col = (255, 255, 255)
+            for dy in range(-1, 2):
+                for dx in range(-1, 2):
+                    if abs(dx) != abs(dy):
+                        ny, nx = ry+dy, rx+dx
+                        if 0 <= ny < cv.shape[0] and 0 <= nx < cv.shape[1]:
+                            cv[ny, nx] = col
+
     im = Image.fromarray(cv, mode="RGB")
     if ps > 1:
         im = im.resize((g.shape[1]*ps, g.shape[0]*ps), Image.NEAREST)
     return im
 
-def add_legend(im, es, g):
+def add_legend(im, es, g, base_idx=None, resources=None):
     cnt = np.bincount(g.ravel(), minlength=len(es))
     tot = cnt.sum()
     out = Image.new("RGB", (im.width+260, max(im.height, 40+28*len(es))), (24,24,28))
@@ -593,49 +872,126 @@ def add_legend(im, es, g):
         d.rectangle([im.width+16, y, im.width+40, y+18], fill=rgb, outline=(255,255,255))
         pct = 100.0*cnt[i]/max(tot,1)
         d.text((im.width+48, y), "%s %.1f pct" % (e.label, pct), fill=(230,230,230))
+
+    # Base legend
+    if base_idx is not None:
+        bases = np.unique(base_idx)
+        for base_id in bases:
+            if base_id == -1:
+                continue
+            y = 40 + len(es)*28 + 20 + base_id*28
+            d.rectangle([im.width+16, y, im.width+40, y+18], fill=PAL[base_id % len(PAL)], outline=(255,255,255))
+            d.text((im.width+48, y), "Base %d" % base_id, fill=(230,230,230))
+    if resources:
+        for base_id, rx, ry in resources[:8]:  # limit to 8 for legend
+            y = 40 + len(es)*28 + 20 + len(bases)*28 + 20 + base_id*28
+            try:
+                rgb = hex_rgb(PAL[base_id % len(PAL)])
+            except Exception:
+                rgb = (128,128,128)
+            d.ellipse([im.width+16+8, y+4, im.width+16+24, y+20], fill=(255,255,255), outline=rgb)
+            d.text((im.width+16+30, y-2), "⛶ %d" % base_id, fill=(230,230,230))
     return out
 
-def f2_generate(jf, w, h, sc, oc, sd, ps):
+def f2_generate(jf, w, h, sc, oc, sd, ps, n_bases=1, n_res=2):
+    # Materials: reuse what is already loaded, otherwise read the upload.
+    # NOTE: the JSON payload is *always* inspected when an upload is given,
+    # so a `texture` carried by the JSON reaches the generator even when
+    # materials were loaded earlier (previously jf was ignored in that case).
     es = GEN.get("entries")
+    jf_payload = None
+    if jf is not None and not (isinstance(jf, str) and not jf.strip()):
+        try:
+            _, jf_payload = _read_json_payload(jf)
+        except Exception:
+            jf_payload = None
     if es is None:
-        es, _ = load_entries(jf)
+        es = from_json(jf_payload) if isinstance(jf_payload, dict) else []
+        if not es:
+            raise gr.Error("No materials. Export (Feature 1) or upload a resource_label.json.")
+        GEN["entries"] = es
     w = max(8, min(int(w), 512))
     h = max(8, min(int(h), 512))
     nz = pfield(w, h, float(sc), int(oc), int(sd))
-    g = domap(nz, es)
-    GEN.update({"grid": g, "seed": int(sd)})
-    im = add_legend(drawmap(g, es, int(ps)), es, g)
+
+    # Base placement: low-freq noise, greedy spacing
+    base_field = pfield(w, h, float(sc) * 2.0, 3, int(sd))
+    g, base_idx = domap(nz, es, base_field=base_field, n_bases=n_bases, min_base_dist=30)
+
+    # Resources: high-freq noise, clustered on each base
+    res_field = pfield(w, h, float(sc) * 5.0, 7, int(sd) + 77777)
+    resources = place_resources(base_idx, res_field, n_res)
+
+    # Texture the generator renders from: if the input JSON already carries a
+    # per-cell texture, use it directly; otherwise derive colours from materials.
+    texture = None
+    if jf_payload is not None and "texture" in jf_payload:
+        raw = jf_payload["texture"]
+        if raw is not None:
+            try:
+                texture = np.asarray(raw, dtype=np.uint8)
+                if texture.ndim != 3 or texture.shape[2] != 3:
+                    texture = None
+            except Exception:
+                texture = None
+    if texture is not None and (texture.shape[0] != g.shape[0] or texture.shape[1] != g.shape[1]):
+        texture = None
+    if texture is None:
+        texture = _texture_grid(g, es)
+    GEN.update({"grid": g, "base_idx": base_idx, "resources": resources, "seed": int(sd), "texture": texture})
+    im = add_legend(drawmap(g, es, int(ps), base_idx=base_idx, resources=resources, texture=texture), es, g,
+                    base_idx=base_idx, resources=resources)
     cnt = np.bincount(g.ravel(), minlength=len(es))
     tot = cnt.sum()
     parts = ["%s:%.1f pct" % (es[k].label, 100.0*cnt[k]/tot) for k in range(len(es))]
-    st = "Seed=%s %dx%d | " % (sd, w, h) + ", ".join(parts)
+    base_str = ", ".join(["B%d:%d" % (b, (base_idx==b).sum()) for b in np.unique(base_idx) if b >= 0])
+    res_str = ", ".join(["B%d:%d" % (b, sum(1 for r in resources if r[0]==b)) for b in np.unique(base_idx) if b >= 0])
+    st = "Seed=%s %dx%d | Bases: %s | Res: %s | " % (sd, w, h, base_str, res_str) + ", ".join(parts)
     return np.array(im), st
 
-def f2_regen(jf, w, h, sc, oc, ps):
-    return f2_generate(jf, w, h, sc, oc, random.randint(0, 999999), ps)
+def f2_regen(jf, w, h, sc, oc, ps, nb=1, nr=2):
+    return f2_generate(jf, w, h, sc, oc, random.randint(0, 999999), ps, nb, nr)
 
 def f2_png():
     if GEN.get("grid") is None:
         raise gr.Error("Generate first.")
     es = GEN["entries"]
-    im = add_legend(drawmap(GEN["grid"], es, 8), es, GEN["grid"])
-    fd, p = tempfile.mkstemp(prefix="procedural_map_", suffix=".png")
-    os.close(fd)
-    im.save(p)
-    return p
+    g = GEN["grid"]
+    base_idx = GEN.get("base_idx")
+    resources = GEN.get("resources")
+    texture = GEN.get("texture")
+    im = add_legend(drawmap(g, es, 8, base_idx=base_idx, resources=resources, texture=texture), es, g,
+                    base_idx=base_idx, resources=resources)
+    return _export_auto("procedural_map.png", lambda p: im.save(p), "Map PNG exported.")
 
 def f2_mat():
     if GEN.get("grid") is None:
         raise gr.Error("Generate first.")
     es = GEN["entries"]
     g = GEN["grid"]
-    pay = {"meta": {"seed": GEN["seed"]}, "resources": [asdict(e) for e in es],
+    base_idx = GEN.get("base_idx")
+    resources = GEN.get("resources")
+    base_idx_arr = base_idx if base_idx is not None else np.full((0, 0), -1, dtype=np.int32)
+    n_bases = int((base_idx_arr >= 0).sum())
+    n_res = len(resources or [])
+    pay = {"meta": {"seed": GEN["seed"], "n_bases": n_bases, "n_res": n_res},
+           "materials": [asdict(e) for e in es],
            "grid_ids": g.tolist(),
-           "grid_labels": [[es[int(v)].label for v in row] for row in g.tolist()]}
-    fd, p = tempfile.mkstemp(prefix="generated_map_matrix_", suffix=".json")
-    os.close(fd)
-    open(p,"w",encoding="utf-8").write(json.dumps(pay))
-    return p
+           "grid_labels": [[es[int(v)].label for v in row] for row in g.tolist()],
+           "base_grid": base_idx.tolist() if base_idx is not None else None,
+           "resource_positions": [[int(r[0]), int(r[1]), int(r[2])] for r in (resources or [])],
+           "texture": _texture_grid(g, es).tolist()}
+    return _export_auto("generated_map_matrix.json",
+                        lambda p: open(p, "w", encoding="utf-8").write(json.dumps(pay)),
+                        "Grid JSON exported.")
+
+def _reveal_exports():
+    p = os.path.abspath(get_export_dir())
+    try:
+        os.startfile(p)  # type: ignore[attr-defined]
+    except Exception as e:
+        raise gr.Error("Could not open folder %s: %s" % (_rel(p), e))
+    return "Opened:\n" + _rel(p)
 
 def build_ui():
     with gr.Blocks(title=APP_TITLE, theme=gr.themes.Soft()) as d:
@@ -664,8 +1020,11 @@ def build_ui():
                 col_count=(7, "fixed"), interactive=True, wrap=True, label="Segments (hover any row for spotlight minimap)",
                 elem_id="segtable")
             with gr.Row():
-                eb = gr.Button("Export resource_label.json", variant="primary")
-                jo = gr.File(label="resource_label.json")
+                eb = gr.Button("💾 Save resource_label.json", variant="primary")
+            with gr.Row():
+                jo = gr.Textbox(label="Saved file path", interactive=False, show_copy_button=True)
+            with gr.Row():
+                reveal1 = gr.Button("📁 Open export folder")
             sb.click(f1_scan, [im, kk, md, mp, ma, ov, mg], [so, tb, st])
             d.load(None, None, None, js="""() => {
 if (window.__segHover) return; window.__segHover = true;
@@ -715,6 +1074,7 @@ document.addEventListener('mouseleave', hide, true);
                 js="(a) => { var lay = document.getElementById('reallay');"
                    " if (lay) lay.style.opacity = (parseFloat(a) || 0).toString(); }")
             eb.click(f1_export, [tb], [jo])
+            reveal1.click(_reveal_exports, None, [jo])
         with gr.Tab("Feature 2 - Generator"):
             with gr.Row():
                 with gr.Column():
@@ -727,6 +1087,8 @@ document.addEventListener('mouseleave', hide, true);
                     oc = gr.Slider(1, 8, value=4, step=1, label="Octaves")
                     sd = gr.Number(value=0, label="Seed", precision=0)
                     ps = gr.Slider(1, 16, value=4, step=1, label="Pixel scale")
+                    nb = gr.Slider(1, 8, value=1, step=1, label="Bases count")
+                    nr = gr.Slider(1, 4, value=2, step=1, label="Resources per base")
                     with gr.Row():
                         gb = gr.Button("Generate", variant="primary")
                         rb = gr.Button("Regenerate")
@@ -734,16 +1096,41 @@ document.addEventListener('mouseleave', hide, true);
                     mo = gr.Image(label="Map plus legend")
                     ss = gr.Textbox(label="Stats", interactive=False)
                     with gr.Row():
-                        pb = gr.Button("Export PNG")
-                        mb = gr.Button("Export grid JSON")
+                        pb = gr.Button("💾 Save PNG")
+                        mb = gr.Button("💾 Save grid JSON")
                     with gr.Row():
-                        po = gr.File(label="PNG")
-                        mo2 = gr.File(label="generated_map_matrix.json")
+                        po = gr.Textbox(label="Saved PNG path", interactive=False, show_copy_button=True)
+                        mo2 = gr.Textbox(label="Saved grid JSON path", interactive=False, show_copy_button=True)
+                    with gr.Row():
+                        reveal2 = gr.Button("📁 Open export folder")
             lb.click(lambda f: load_entries(f)[1], [jf], [mi])
-            gb.click(f2_generate, [jf, wi, hi, sc, oc, sd, ps], [mo, ss])
-            rb.click(f2_regen, [jf, wi, hi, sc, oc, ps], [mo, ss])
-            pb.click(lambda: f2_png(), None, [po])
-            mb.click(lambda: f2_mat(), None, [mo2])
+            gb.click(f2_generate, [jf, wi, hi, sc, oc, sd, ps, nb, nr], [mo, ss])
+            rb.click(f2_regen, [jf, wi, hi, sc, oc, ps, nb, nr], [mo, ss])
+            pb.click(f2_png, None, [po])
+            mb.click(f2_mat, None, [mo2])
+            reveal2.click(_reveal_exports, None, [mo2])
+        with gr.Tab("⚙ Settings"):
+            gr.Markdown("### Export folder\nAll Save buttons write here automatically. "
+                        "Pick a folder once - it is remembered in `settings.json`.")
+            with gr.Row():
+                ex_dir = gr.Textbox(label="Export folder", value=_rel(get_export_dir()), interactive=False,
+                                    show_copy_button=True, scale=4)
+                ex_open = gr.Button("📁 Open", scale=1)
+            with gr.Row():
+                ex_pick = gr.File(label="Browse: pick ANY file inside the folder you want",
+                                  file_count="single", type="filepath")
+                ex_save = gr.Button("✔ Use this folder", variant="primary")
+            ex_msg = gr.Textbox(label="Status", interactive=False)
+            ex_open.click(_reveal_exports, None, [ex_msg])
+
+            def _use_folder(p):
+                if not p:
+                    raise gr.Error("Browse and pick any file inside the target folder first.")
+                folder = p if os.path.isdir(p) else os.path.dirname(os.path.abspath(p))
+                msg = set_export_dir(folder)
+                return msg, _rel(folder)
+
+            ex_save.click(_use_folder, [ex_pick], [ex_msg, ex_dir])
     return d
 
 def launch():
