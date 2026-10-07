@@ -88,6 +88,7 @@ class Res:
     mean_color_hex: str
     coverage: float
     threshold: float
+    texture_png: str = ""  # data-URL PNG exemplar cropped from the scanned reference image
 
 def to_json(es):
     return {"meta": {"app": "MAGER", "version": 1},
@@ -99,7 +100,26 @@ def from_json(data):
         out.append(Res(int(r["id"]), str(r.get("label","seg")),
             str(r.get("color_hex","#808080")),
             str(r.get("mean_color_hex","#808080")),
-            float(r.get("coverage",0)), float(r.get("threshold",0))))
+            float(r.get("coverage",0)), float(r.get("threshold",0)),
+            str(r.get("texture_png","") or "")))
+    return out
+
+
+def _exemplars_from_payload(payload):
+    """Decode {seg_id: exemplar RGB} carried by a resource_label.json payload."""
+    out = {}
+    try:
+        rows = payload.get("resources") or payload.get("materials") or []
+        for r in rows:
+            try:
+                gid = int(r.get("id", -1))
+            except Exception:
+                continue
+            arr = _from_b64_png(r.get("texture_png",""))
+            if arr is not None:
+                out[gid] = arr
+    except Exception:
+        pass
     return out
 
 
@@ -122,6 +142,151 @@ def _read_json_payload(jf):
         return [], None
     es = from_json(data)
     return es, data
+
+def _b64_png(img):
+    """Encode an RGB uint8 array as a data-URL PNG (compact texture exemplar)."""
+    import base64, io
+    buf = io.BytesIO()
+    Image.fromarray(np.ascontiguousarray(img).astype(np.uint8)).save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def _from_b64_png(s):
+    """Decode a data-URL (or raw base64) PNG back to an RGB uint8 array. None on failure."""
+    try:
+        import base64, io
+        if not s or not isinstance(s, str):
+            return None
+        if "," in s:
+            s = s.split(",", 1)[1]
+        raw = base64.b64decode(s)
+        im = Image.open(io.BytesIO(raw)).convert("RGB")
+        return np.array(im)
+    except Exception:
+        return None
+
+
+def _exemplar_crop(orig, label_map, gid, size=48):
+    """Crop a size×size RGB exemplar of segment gid from the scanned reference image.
+
+    Picks the largest connected blob of that segment, crops around its centroid,
+    and falls back to a mean-colour tile when the crop would be empty.
+    """
+    try:
+        size = max(8, min(int(size), 128))
+        m = (np.asarray(label_map) == int(gid))
+        if not m.any():
+            return None
+        mm = m.astype(np.uint8) * 255
+        cnts, _ = cv2.findContours(mm, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if cnts:
+            c = max(cnts, key=cv2.contourArea)
+            M = cv2.moments(c)
+            if M.get("m00", 0) > 0:
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+            else:
+                ys, xs = np.where(m)
+                cy, cx = int(ys.mean()), int(xs.mean())
+        else:
+            ys, xs = np.where(m)
+            cy, cx = int(ys.mean()), int(xs.mean())
+        h, w, _ = orig.shape
+        x0 = max(0, min(w - size, cx - size // 2))
+        y0 = max(0, min(h - size, cy - size // 2))
+        crop = orig[y0:y0 + size, x0:x0 + size]
+        if crop.size == 0:
+            return None
+        if crop.shape[0] != size or crop.shape[1] != size:
+            crop = cv2.resize(crop, (size, size), interpolation=cv2.INTER_AREA)
+        return np.ascontiguousarray(crop)
+    except Exception:
+        return None
+
+
+def _scan_exemplars(size=48):
+    """Build {seg_id: exemplar RGB array} from the last Feature 1 scan.
+
+    Falls back to a mean-colour tile per segment when no reference pixels exist.
+    """
+    out = {}
+    orig = SCAN.get("orig")
+    lmap = SCAN.get("obj_map")
+    info = SCAN.get("info") or []
+    for s in info:
+        gid = int(s.get("id", -1))
+        ex = None
+        if orig is not None and lmap is not None:
+            try:
+                if lmap.shape[:2] != orig.shape[:2]:
+                    lm = cv2.resize(lmap.astype(np.int32),
+                                    (orig.shape[1], orig.shape[0]),
+                                    interpolation=cv2.INTER_NEAREST)
+                else:
+                    lm = lmap
+                ex = _exemplar_crop(orig, lm, gid, size=size)
+            except Exception:
+                ex = None
+        if ex is None:
+            try:
+                rgb = hex_rgb(s.get("mean", "#808080"))
+            except Exception:
+                rgb = (128, 128, 128)
+            ex = np.full((size, size, 3), rgb, dtype=np.uint8)
+        out[gid] = np.ascontiguousarray(ex)
+    return out
+
+
+def _tile_texture(g, exemplars, es, seed=0, jitter=0):
+    """Per-pixel texture for map grid g by tiling each segment's exemplar.
+
+    Each cell samples its segment exemplar with a deterministic per-cell offset
+    (seeded by `seed`), so large regions show the reference grain instead of a
+    flat fill. `jitter` (0..64) randomly perturbs sampled pixels for variety.
+    """
+    h, w = (int(g.shape[0]), int(g.shape[1]))
+    tex = np.zeros((h, w, 3), dtype=np.uint8)
+    rng = np.random.default_rng(int(seed))
+    try:
+        jit = max(0, min(int(jitter), 64))
+    except Exception:
+        jit = 0
+    for k, e in enumerate(es):
+        mask = (g == k)
+        if not mask.any():
+            continue
+        ex = None
+        try:
+            ex = exemplars.get(int(getattr(e, "id", k)), exemplars.get(k))
+        except Exception:
+            ex = None
+        if ex is None:
+            try:
+                rgb = hex_rgb(e.color_hex)
+            except Exception:
+                rgb = (128, 128, 128)
+            tex[mask] = rgb
+            continue
+        ex = np.asarray(ex, dtype=np.uint8)
+        if ex.ndim != 3 or ex.shape[2] != 3 or ex.shape[0] < 1 or ex.shape[1] < 1:
+            try:
+                rgb = hex_rgb(e.color_hex)
+            except Exception:
+                rgb = (128, 128, 128)
+            tex[mask] = rgb
+            continue
+        eh, ew, _ = ex.shape
+        oy = int(rng.integers(0, max(eh, 1)))
+        ox = int(rng.integers(0, max(ew, 1)))
+        ys, xs = np.where(mask)
+        ty = (ys + oy) % eh
+        tx = (xs + ox) % ew
+        tex[ys, xs] = ex[ty, tx]
+    if jit > 0:
+        nz = rng.integers(-jit, jit + 1, size=tex.shape, dtype=np.int16)
+        tex = np.clip(tex.astype(np.int16) + nz, 0, 255).astype(np.uint8)
+    return tex
+
 
 def def_th(n):
     if n <= 1:
@@ -174,6 +339,7 @@ def seg_km(img, k, morph=5):
         info.append({"id": i, "mean": "#%02X%02X%02X" % (mr, mg, mb),
                      "cov": float(cnt[i]/tot), "kind": "lump",
                      "area": int(cnt[i]), "cx": -1, "cy": -1})
+    SCAN["obj_map"] = lm.astype(np.int32)
     return vis, info
 def _lab_means(work, lm, k):
     lab = cv2.cvtColor(work, cv2.COLOR_RGB2LAB).astype(np.float32)
@@ -702,6 +868,16 @@ def f1_export(table):
         es.append(Res(sid, lab, chx, mh, round(cov/100.0,5), thr))
     if not es:
         raise gr.Error("No valid rows. Run Scan first.")
+    # Attach a real-pixel exemplar per segment (cropped from the scanned
+    # reference image) so Feature 2 renders texture, not just flat colour.
+    try:
+        _ex = _scan_exemplars(size=48)
+        for _e in es:
+            _arr = _ex.get(int(_e.id))
+            if _arr is not None:
+                _e.texture_png = _b64_png(_arr)
+    except Exception:
+        pass
     pay = to_json(es)
     def _write(p):
         open(p, "w", encoding="utf-8").write(json.dumps(pay, indent=2))
@@ -922,10 +1098,15 @@ def f2_generate(jf, w, h, sc, oc, sd, ps, n_bases=1, n_res=2):
     res_field = pfield(w, h, float(sc) * 5.0, 7, int(sd) + 77777)
     resources = place_resources(base_idx, res_field, n_res)
 
-    # Texture the generator renders from: if the input JSON already carries a
-    # per-cell texture, use it directly; otherwise derive colours from materials.
+    # Texture the generator renders from (priority order):
+    #  1. full per-cell "texture" carried by a generated_map_matrix.json upload
+    #     (exact pixels, same H×W) -> use directly;
+    #  2. per-material "texture_png" exemplars cropped from the scanned
+    #     reference image (resource_label.json) -> tile per cell so regions
+    #     show real grain instead of a flat fill;
+    #  3. flat material colours (old fallback).
     texture = None
-    if jf_payload is not None and "texture" in jf_payload:
+    if isinstance(jf_payload, dict) and "texture" in jf_payload:
         raw = jf_payload["texture"]
         if raw is not None:
             try:
@@ -937,7 +1118,29 @@ def f2_generate(jf, w, h, sc, oc, sd, ps, n_bases=1, n_res=2):
     if texture is not None and (texture.shape[0] != g.shape[0] or texture.shape[1] != g.shape[1]):
         texture = None
     if texture is None:
-        texture = _texture_grid(g, es)
+        # Tile real reference pixels carried by the materials JSON.
+        # Sources: current upload payload first, then already-loaded entries
+        # (GEN), then the last Feature 1 scan in memory.
+        exemplars = {}
+        if isinstance(jf_payload, dict):
+            exemplars = _exemplars_from_payload(jf_payload)
+        if not exemplars:
+            try:
+                for _e in (es or []):
+                    _arr = _from_b64_png(getattr(_e, "texture_png", ""))
+                    if _arr is not None:
+                        exemplars[int(getattr(_e, "id", -1))] = _arr
+            except Exception:
+                exemplars = {}
+        if not exemplars:
+            try:
+                exemplars = _scan_exemplars(size=48)
+            except Exception:
+                exemplars = {}
+        if exemplars:
+            texture = _tile_texture(g, exemplars, es, seed=int(sd))
+        else:
+            texture = _texture_grid(g, es)
     GEN.update({"grid": g, "base_idx": base_idx, "resources": resources, "seed": int(sd), "texture": texture})
     im = add_legend(drawmap(g, es, int(ps), base_idx=base_idx, resources=resources, texture=texture), es, g,
                     base_idx=base_idx, resources=resources)
@@ -974,13 +1177,20 @@ def f2_mat():
     base_idx_arr = base_idx if base_idx is not None else np.full((0, 0), -1, dtype=np.int32)
     n_bases = int((base_idx_arr >= 0).sum())
     n_res = len(resources or [])
+    _tex = GEN.get("texture")
+    try:
+        _tex_arr = np.asarray(_tex, dtype=np.uint8) if _tex is not None else None
+    except Exception:
+        _tex_arr = None
+    if _tex_arr is None or _tex_arr.shape[:2] != g.shape[:2]:
+        _tex_arr = _texture_grid(g, es)  # flat-colour fallback only
     pay = {"meta": {"seed": GEN["seed"], "n_bases": n_bases, "n_res": n_res},
            "materials": [asdict(e) for e in es],
            "grid_ids": g.tolist(),
            "grid_labels": [[es[int(v)].label for v in row] for row in g.tolist()],
            "base_grid": base_idx.tolist() if base_idx is not None else None,
            "resource_positions": [[int(r[0]), int(r[1]), int(r[2])] for r in (resources or [])],
-           "texture": _texture_grid(g, es).tolist()}
+           "texture": _tex_arr.tolist()}
     return _export_auto("generated_map_matrix.json",
                         lambda p: open(p, "w", encoding="utf-8").write(json.dumps(pay)),
                         "Grid JSON exported.")
