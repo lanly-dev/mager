@@ -1333,6 +1333,209 @@ def f4_export(fmt):
         raise gr.Error("Tick at least one export format.")
     return "Exported:\n" + "\n".join(_rel(p) for p in outs)
 
+# ---------- feature 4: map-spec export (agent-readable contract) ----------
+# The spec is the hinge everything hangs on: reference extraction outputs it,
+# the generator consumes it, agents write it, games render it. Schema lives at
+# spec/map-spec.schema.json (draft-07, game-agnostic core + per-game profiles).
+_SPEC_SCHEMA_PATH = os.path.join(HERE, "spec", "map-spec.schema.json")
+_spec_schema_cache = None
+
+def _load_spec_schema():
+    global _spec_schema_cache
+    if _spec_schema_cache is None:
+        try:
+            with open(_SPEC_SCHEMA_PATH, "r", encoding="utf-8") as f:
+                _spec_schema_cache = json.load(f)
+        except Exception as e:
+            raise gr.Error("Cannot read spec schema %s: %s" % (_rel(_SPEC_SCHEMA_PATH), e))
+    return _spec_schema_cache
+
+def validate_spec(spec):
+    """Validate a map-spec dict against spec/map-spec.schema.json.
+
+    Raises gr.Error with a readable message on failure. Callers must validate
+    BEFORE writing anything: on failure nothing is written."""
+    try:
+        import jsonschema
+    except ImportError:
+        raise gr.Error("The 'jsonschema' package is not installed. Run: pip install -r requirements.txt")
+    schema = _load_spec_schema()
+    try:
+        jsonschema.validate(instance=spec, schema=schema)
+    except Exception as e:  # ValidationError (has .message/.path); be defensive
+        msg = str(getattr(e, "message", e))
+        path = list(getattr(e, "path", None) or [])
+        loc = ("/" + "/".join(str(p) for p in path)) if path else ""
+        raise gr.Error("Map spec invalid%s: %s" % (loc, msg))
+
+def _cell_to_world(i, j, w, h, size=600.0):
+    # Cell (i, j) of a w×h grid -> world units, origin at map center.
+    # Schema: x right, z down-screen (j/row maps to z), y up.
+    fx = (i / (w - 1) - 0.5) * size if w > 1 else 0.0
+    fz = (j / (h - 1) - 0.5) * size if h > 1 else 0.0
+    return fx, fz
+
+def _kind_from_label(label):
+    # Resource kind from the material label under the resource's cell.
+    # Keyword match (case-insensitive) on metal/energy/oil; anything else is
+    # "neutral" (decorative / game decides). Documented rule, not a guess:
+    # MAGER resources carry no kind of their own, so the material underneath
+    # is the only signal available.
+    lab = str(label or "").lower()
+    for kind in ("metal", "energy", "oil"):
+        if kind in lab:
+            return kind
+    return "neutral"
+
+def build_map_spec():
+    """Build a map-spec dict (spec/map-spec.schema.json) from the last Feature 2 generation.
+
+    Returns (spec, artifacts) where artifacts is a list of
+    (filename, ndarray, kind) with kind "u16" (heightmap) or "rgba" (splatmap).
+    Referenced PNG filenames are relative to the spec JSON's folder.
+    Raises gr.Error("Generate first") when GEN is empty."""
+    g = GEN.get("grid")
+    if g is None:
+        raise gr.Error("Generate first.")
+    g = np.asarray(g)
+    if g.ndim != 2:
+        raise gr.Error("Generate first.")
+    h, w = int(g.shape[0]), int(g.shape[1])
+    es = GEN.get("entries") or []
+    try:
+        seed = int(GEN.get("seed"))
+    except (TypeError, ValueError):
+        seed = 0
+
+    import datetime
+    name = "map_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    height_fname = "%s_height.png" % name
+    splat_fname = "%s_splat.png" % name
+
+    # Heightfield: explicit 16-bit PNG. GEN["height"] is pfield() output,
+    # already min-max normalized to [0, 1] by construction.
+    nz = GEN.get("height")
+    try:
+        nz = np.asarray(nz, dtype=np.float64)
+    except Exception:
+        raise gr.Error("Generation has no usable height field. Regenerate the map.")
+    if nz.shape != (h, w):
+        raise gr.Error("Height field shape %s != grid shape (%d, %d). Regenerate." % (nz.shape, h, w))
+    # minHeight/maxHeight are normalized units: the PNG spans the data range
+    # [0, 1] and the consumer (game profile) multiplies by its own height
+    # scale. Honest because pfield() guarantees the [0, 1] normalization.
+    height_u16 = (np.clip(nz, 0.0, 1.0) * 65535.0 + 0.5).astype(np.uint16)
+    heightfield = {"mode": "explicit", "png": height_fname,
+                   "minHeight": 0.0, "maxHeight": 1.0}
+    if w >= 16:  # schema requires resolution >= 16 when present; MAGER allows 8px grids
+        heightfield["resolution"] = w
+
+    # Materials palette from the generation's entries.
+    palette = []
+    for pos, e in enumerate(es):
+        try:
+            eid = max(0, int(getattr(e, "id", pos)))
+        except (TypeError, ValueError):
+            eid = pos
+        col = str(getattr(e, "color_hex", "") or "")
+        if len(col) != 7 or not col.startswith("#"):
+            col = "#808080"
+        palette.append({"id": eid, "label": str(getattr(e, "label", "seg") or "seg"),
+                        "color": col})
+
+    # Splatmap: the generator's textured render as RGBA when available,
+    # else per-material channel masks (same convention as the "c) RGBA
+    # splatmap PNG" export).
+    splat = None
+    try:
+        _t = np.asarray(GEN.get("texture"), dtype=np.uint8) if GEN.get("texture") is not None else None
+    except Exception:
+        _t = None
+    if _t is not None and _t.ndim == 3 and _t.shape[2] == 3 and _t.shape[:2] == (h, w):
+        splat = np.dstack([_t, np.full((h, w), 255, dtype=np.uint8)])
+    else:
+        k = min(4, max(1, len(es)))
+        splat = np.zeros((h, w, 4), dtype=np.uint8)
+        for i in range(k):
+            splat[:, :, i] = np.where(g == i, 255, 0).astype(np.uint8)
+
+    # Resources: GEN stores (base_id, cell_x, cell_y). Kind comes from the
+    # material label under the resource's cell (see _kind_from_label).
+    # Reserve default 2400 matches the rts deposit size; a game profile may
+    # override per kind later.
+    resources = []
+    for _r in (GEN.get("resources") or []):
+        try:
+            _b, _xx, _yy = int(_r[0]), int(_r[1]), int(_r[2])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if not (0 <= _xx < w and 0 <= _yy < h):
+            continue
+        try:
+            _lab = es[int(g[_yy, _xx])].label
+        except (IndexError, ValueError, TypeError):
+            _lab = ""
+        _wx, _wz = _cell_to_world(_xx, _yy, w, h)
+        resources.append({"kind": _kind_from_label(_lab),
+                          "x": round(_wx, 2), "z": round(_wz, 2), "reserve": 2400})
+
+    # Bases: centroid of each base's cells -> world coords. Pad radius is
+    # 10 cells, matching the resource clustering radius in place_resources();
+    # scenery clearRadius covers the same disc.
+    cell = 600.0 / w if w else 600.0
+    base_radius = round(10.0 * cell, 2)
+    bases = []
+    _bi = GEN.get("base_idx")
+    if _bi is not None:
+        try:
+            _bi = np.asarray(_bi)
+            for _b in sorted(int(v) for v in np.unique(_bi) if int(v) >= 0):
+                _ys, _xs = np.where(_bi == _b)
+                if len(_xs) == 0:
+                    continue
+                _wx, _wz = _cell_to_world(float(_xs.mean()), float(_ys.mean()), w, h)
+                bases.append({"x": round(_wx, 2), "z": round(_wz, 2),
+                              "radius": base_radius})
+        except Exception as e:
+            print("mager: base extraction failed (%s)" % e, file=sys.stderr)
+
+    spec = {
+        "meta": {"spec": "mager-map", "version": 1, "name": name, "seed": seed},
+        "heightfield": heightfield,
+        # 600x600 is the first consumer's (rts) world size; other games read
+        # their own size from their profile or override these fields.
+        "world": {"width": 600, "depth": 600},
+        "materials": {"palette": palette, "splatmapPng": splat_fname},
+        "resources": resources,
+        "bases": bases,
+        # No density control in the UI yet; 0.5 is the neutral default.
+        "scenery": {"density": 0.5, "seed": seed, "clearRadius": base_radius},
+        "profiles": {"rts": {"layer": "surface", "biome": "verdant"}},
+    }
+    artifacts = [(height_fname, height_u16, "u16"), (splat_fname, splat, "rgba")]
+    return spec, artifacts
+
+def f4_spec():
+    """Export map spec: build from GEN, validate, then write JSON + PNGs.
+
+    Validation happens BEFORE any write: on failure nothing is written."""
+    spec, artifacts = build_map_spec()
+    validate_spec(spec)
+    d = get_export_dir()
+    paths = []
+    for fname, arr, kind in artifacts:
+        p = os.path.join(d, fname)
+        if kind == "u16":
+            cv2.imwrite(p, arr)
+        else:
+            Image.fromarray(arr, "RGBA").save(p)
+        paths.append(p)
+    jp = os.path.join(d, spec["meta"]["name"] + ".map.json")
+    with open(jp, "w", encoding="utf-8") as f:
+        json.dump(spec, f, indent=2)
+    paths.append(jp)
+    return "Map spec exported (schema-validated):\n" + "\n".join(_rel(p) for p in paths)
+
 def _reveal_exports():
     p = os.path.abspath(get_export_dir())
     try:
@@ -1496,6 +1699,10 @@ document.addEventListener('mouseleave', hide, true);
             ex_btn = gr.Button("Export selected", variant="primary")
             ex_msg = gr.Textbox(label="Export log")
             ex_btn.click(f4_export, [ex_fmt], [ex_msg])
+            with gr.Row():
+                sp_btn = gr.Button("🗺 Export map spec", variant="primary")
+            sp_msg = gr.Textbox(label="Map spec export (schema-validated)")
+            sp_btn.click(f4_spec, None, [sp_msg])
         with gr.Tab("⚙ Settings"):
             gr.Markdown("### Export folder\nAll Save buttons write here automatically. "
                         "Pick a folder once - it is remembered in `settings.json`.")

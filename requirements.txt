@@ -5,3 +5,4 @@ opencv-python>=4.8.0,<5
 numpy>=1.24.0,<3
 perlin-noise>=1.13,<2
 Pillow>=10.0.0,<12
+jsonschema>=4.23,<5
