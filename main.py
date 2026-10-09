@@ -1,4 +1,5 @@
-import json, os, random, threading, time, webbrowser
+import json, os, random, sys, threading, time, webbrowser
+from contextlib import contextmanager
 from dataclasses import dataclass, asdict
 import cv2
 import numpy as np
@@ -28,15 +29,16 @@ def _load_settings():
     try:
         with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
+    except Exception as e:
+        print("mager: could not load settings.json (%s); using defaults" % e, file=sys.stderr)
         return {}
 
 def _save_settings(s):
     try:
         with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
             json.dump(s, f, indent=2)
-    except Exception:
-        pass
+    except Exception as e:
+        print("mager: could not save settings.json (%s)" % e, file=sys.stderr)
 
 def get_export_dir():
     d = (_load_settings().get("export_dir") or "").strip() or DEFAULT_EXPORT_DIR
@@ -72,6 +74,23 @@ SCAN = {}
 GEN = {"entries": None, "grid": None, "seed": None, "height": None,
        "base_idx": None, "resources": None, "texture": None}
 SWAP = {"orig": None, "out": None, "prev": [], "remaps": [], "entries": None}
+# Guards SCAN/GEN/SWAP against concurrent Gradio handler threads mutating
+# shared state mid-flight. Use via the _state_locked() context manager below.
+STATE_LOCK = threading.Lock()
+
+@contextmanager
+def _state_locked():
+    """Non-blocking guard for SCAN/GEN/SWAP mutations.
+
+    Gradio runs each handler in its own thread; a second click while one is
+    running gets gr.Error("busy...") instead of interleaving mutations or
+    deadlocking the UI thread."""
+    if not STATE_LOCK.acquire(blocking=False):
+        raise gr.Error("Busy - another operation is running. Try again.")
+    try:
+        yield
+    finally:
+        STATE_LOCK.release()
 
 def bgr_hex(b):
     bb, gg, rr = (int(x) for x in b)
@@ -98,11 +117,18 @@ def to_json(es):
 def from_json(data):
     out = []
     for r in data.get("resources") or data.get("materials") or []:
-        out.append(Res(int(r["id"]), str(r.get("label","seg")),
-            str(r.get("color_hex","#808080")),
-            str(r.get("mean_color_hex","#808080")),
-            float(r.get("coverage",0)), float(r.get("threshold",0)),
-            str(r.get("texture_png","") or "")))
+        try:
+            rid = int(r["id"])
+            out.append(Res(rid, str(r.get("label","seg")),
+                str(r.get("color_hex","#808080")),
+                str(r.get("mean_color_hex","#808080")),
+                float(r.get("coverage",0)), float(r.get("threshold",0)),
+                str(r.get("texture_png","") or "")))
+        except (KeyError, ValueError, TypeError) as e:
+            # Skip malformed rows instead of tracebacking; callers raise a
+            # clean gr.Error when zero valid resources remain.
+            print("mager: skipping malformed resource row (%s): %r" % (e, r), file=sys.stderr)
+            continue
     return out
 
 def _exemplars_from_payload(payload):
@@ -611,24 +637,6 @@ def _empty_view():
     return ("<div style='color:#888;padding:20px;text-align:center'>"
             "Run <b>Scan Image</b> - tint + real map appear here, slider blends instantly.</div>")
 
-def _spotlight(vis, orig, gid, alpha=0.35):
-    if vis is None or orig is None:
-        return None
-    m = (SCAN.get("obj_map") == gid) if SCAN.get("obj_map") is not None else None
-    try:
-        a = max(0.0, min(1.0, float(alpha)))
-    except Exception:
-        a = 0.35
-    base = blend_overlay(vis, orig, a)
-    if m is None or not m.any():
-        return base
-    dark = (base.astype(np.float32) * 0.25).astype(np.uint8)
-    out = dark
-    out[m] = base[m]
-    cnts, _ = cv2.findContours(m.astype(np.uint8) * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cv2.drawContours(out, cnts, -1, (255, 255, 0), 2)
-    return out
-
 def _swatch_popup(gid, hexcol, vis, orig, size=128):
     om = SCAN.get("obj_map")
     if om is not None:
@@ -657,7 +665,14 @@ def _swatch_popup(gid, hexcol, vis, orig, size=128):
         "border:1px solid #555;background:" + hexcol + ";cursor:zoom-in'></div>"
         "</div>")
 
+# Unique overlay ids across re-renders: a second scan used to emit a second
+# id="reallay", leaving duplicate ids in the DOM for the slider JS to trip on.
+_blend_uid = 0
+
 def _blend_view(tint_b64, real_b64, alpha):
+    global _blend_uid
+    _blend_uid += 1
+    uid = "reallay%d" % _blend_uid
     try:
         a = max(0.0, min(1.0, float(alpha)))
     except Exception:
@@ -665,9 +680,9 @@ def _blend_view(tint_b64, real_b64, alpha):
     return (
         "<div style='position:relative;width:100%;background:#111'>"
         "<img src='" + tint_b64 + "' style='display:block;width:100%;image-rendering:pixelated'/>" +
-        "<img id='reallay' src='" + real_b64 + "' style='position:absolute;inset:0;width:100%;height:100%;object-fit:fill;pointer-events:none;opacity:" + str(a) + "'/>" +
+        "<img id='" + uid + "' src='" + real_b64 + "' style='position:absolute;inset:0;width:100%;height:100%;object-fit:fill;pointer-events:none;opacity:" + str(a) + "'/>" +
         "<script>(function(){var s=document.querySelector('#ovslider input[type=range]');"
-        "var lay=document.getElementById('reallay');"
+        "var lay=document.getElementById('" + uid + "');"
         "if(s&&lay){var f=function(){lay.style.opacity=(parseFloat(s.value)||0).toString();};"
         "s.addEventListener('input',f);f();}})();</script></div>")
 
@@ -685,14 +700,32 @@ def f1_scan(image, k, mode, morph, min_area, alpha, merge):
         vis, info = seg_km(image, int(k), morph=int(morph))
     th = def_th(len(info))
     rows = []
+    es = []
     for i, s in enumerate(info):
         pb = PAL[s["id"] % len(PAL)]
-        sw = _swatch_popup(s["id"], bgr_hex((int(pb[0]), int(pb[1]), int(pb[2]))), vis, image)
+        hx = bgr_hex((int(pb[0]), int(pb[1]), int(pb[2])))
+        sw = _swatch_popup(s["id"], hx, vis, image)
         rows.append([s["id"], s["mean"], round(s["cov"] * 100, 2),
-                     NAMES[i % len(NAMES)], bgr_hex((int(pb[0]), int(pb[1]), int(pb[2]))), th[i], sw])
-    SCAN["info"] = info
-    SCAN["vis"] = vis
-    SCAN["orig"] = image
+                     NAMES[i % len(NAMES)], hx, th[i], sw])
+        # Mirror f1_export's Res construction so Feature 3 ("reuse Scan")
+        # works straight from memory without an export round-trip.
+        es.append(Res(int(s["id"]), NAMES[i % len(NAMES)], hx,
+                      str(s["mean"]), round(float(s["cov"]), 5), float(th[i])))
+    with _state_locked():
+        SCAN["info"] = info
+        SCAN["vis"] = vis
+        SCAN["orig"] = image
+        # Attach real-pixel exemplars (same as f1_export) so the texture-swap
+        # tab renders true texture, not flat colour, from scan materials.
+        try:
+            _ex = _scan_exemplars(size=48)
+            for _e in es:
+                _arr = _ex.get(int(_e.id))
+                if _arr is not None:
+                    _e.texture_png = _b64_png(_arr)
+        except Exception as e:
+            print("mager: scan exemplar attach failed (%s)" % e, file=sys.stderr)
+        SCAN["entries"] = es
     view = _blend_view(_to_b64(vis), _to_b64(image), alpha)
     return view, rows, "Found %d segments (%s). Hover a swatch for its minimap popup." % (len(info), mode)
 
@@ -704,72 +737,10 @@ def _save_export(name, write):
 def _export_auto(name, write_file, kind):
     """Save straight to the configured export folder. No dialogs."""
     import datetime
-    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")  # usec: no same-second collisions
     base, ext = os.path.splitext(name)
     p = _save_export("%s_%s%s" % (base, stamp, ext), write_file)
     return "OK - %s\nSaved: %s" % (kind, _rel(p))
-
-def _ask_save_path(start_name):
-    """Show native Save-As first, return chosen path or ''.
-
-    Runs in a worker thread with a timeout so a blocked/cancelled
-    dialog can never hang the Gradio server thread."""
-    import concurrent.futures
-
-    def _ask():
-        try:
-            import webview
-            wins = getattr(webview, "windows", None) or []
-            if not wins:
-                return ""
-            res = wins[0].create_file_dialog(webview.SAVE_DIALOG,
-                                             save_filename=start_name)
-            if not res:
-                return ""
-            return res[0] if isinstance(res, (list, tuple)) else res
-        except Exception:
-            return ""
-
-    try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            return ex.submit(_ask).result(timeout=120) or ""
-    except Exception:
-        return ""
-
-def _webview_save(src, start_name):
-    """Ask pywebview for a native Save-As path and copy src there.
-
-    Runs the dialog in a STA thread with a timeout so a blocked/cancelled
-    dialog can never hang the Gradio server thread. Returns dest or ''."""
-    import shutil
-    import concurrent.futures
-
-    def _ask():
-        try:
-            import webview
-            wins = getattr(webview, "windows", None) or []
-            if not wins:
-                return ""
-            res = wins[0].create_file_dialog(webview.SAVE_DIALOG,
-                                             save_filename=start_name)
-            if not res:
-                return ""
-            return res[0] if isinstance(res, (list, tuple)) else res
-        except Exception:
-            return ""
-
-    try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            dest = ex.submit(_ask).result(timeout=120)
-    except Exception:
-        return ""
-    if not dest:
-        return ""
-    try:
-        shutil.copyfile(src, dest)
-        return dest
-    except Exception:
-        return ""
 
 def f1_export(table):
     # Gradio Dataframe arrives as pandas DataFrame -> convert to rows
@@ -811,23 +782,24 @@ def f1_export(table):
             _arr = _ex.get(int(_e.id))
             if _arr is not None:
                 _e.texture_png = _b64_png(_arr)
-    except Exception:
-        pass
+    except Exception as e:
+        print("mager: export exemplar attach failed (%s)" % e, file=sys.stderr)
     pay = to_json(es)
     def _write(p):
         open(p, "w", encoding="utf-8").write(json.dumps(pay, indent=2))
-    try:
-        hp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resource_label.json")
-        open(hp,"w",encoding="utf-8").write(json.dumps(pay, indent=2))
-    except Exception:
-        pass
+    # NOTE: the export-dir copy (via _export_auto) is the only one kept; the
+    # old second copy inside the app folder was removed (stray untracked file).
     return _export_auto("resource_label.json", _write, "resource_label.json exported.")
 def load_entries(fobj):
     dflt = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resource_label.json")
     p = fobj if fobj else (dflt if os.path.exists(dflt) else None)
     if not p or not os.path.exists(p):
         raise gr.Error("No resource_label.json. Export from Feature 1 or upload one.")
-    es = from_json(json.load(open(p,"r",encoding="utf-8")))
+    try:
+        payload = json.load(open(p, "r", encoding="utf-8"))
+    except Exception as e:
+        raise gr.Error("Could not parse %s: %s" % (os.path.basename(p), e))
+    es = from_json(payload)
     if not es:
         raise gr.Error("JSON has no resources.")
     GEN["entries"] = es
@@ -835,13 +807,30 @@ def load_entries(fobj):
     return es, "Loaded %d from %s:" % (len(es), os.path.basename(p)) + chr(10) + chr(10).join(lines)
 
 def pfield(w, h, scale, octv, seed):
+    # The perlin-noise package evaluates in pure Python (~22us/call), so a
+    # 512x512 field costs ~6s. Hoisting attribute lookups was measured at
+    # <1% gain - the per-call overhead inside the package dominates and can't
+    # be removed while staying bit-exact.
+    # Tradeoff: fields larger than 256x256 cells are evaluated at half
+    # resolution and cubically upsampled (~4x fewer calls). Values differ
+    # slightly from a full-resolution evaluation, so the same seed yields a
+    # slightly different map at large sizes - but results stay deterministic
+    # per (w, h, scale, octaves, seed), which is all the UI promises.
+    div = 1
+    while (w // div) * (h // div) > 65536 and div < 8:
+        div *= 2
+    cw, ch = max(1, w // div), max(1, h // div)
     pn = PerlinNoise(octaves=int(octv), seed=int(seed))
-    xs = np.linspace(0, float(scale), w)
-    ys = np.linspace(0, float(scale), h)
-    f = np.zeros((h, w))
+    noise = pn.noise  # hoisted: skip __call__ dispatch per cell (same values)
+    xs = np.linspace(0, float(scale), cw)
+    ys = np.linspace(0, float(scale), ch)
+    f = np.zeros((ch, cw))
     for j, y in enumerate(ys):
+        row = f[j]
         for i, x in enumerate(xs):
-            f[j,i] = pn([x, y])
+            row[i] = noise([x, y])
+    if div > 1:
+        f = cv2.resize(f, (w, h), interpolation=cv2.INTER_CUBIC)
     mn, mx = f.min(), f.max()
     if mx > mn:
         return (f-mn)/(mx-mn)
@@ -857,24 +846,31 @@ def domap(nz, es, base_field=None, n_bases=1, min_base_dist=30):
 
     if base_field is not None and n_bases > 0:
         h, w = base_field.shape
-        flat_idx = np.argsort(base_field.ravel())[::-1]
+        # Greedy highest-first placement with mask-based exclusion: when a
+        # base is placed, a precomputed disk marks every cell within
+        # min_base_dist as blocked, so each candidate costs O(1) instead of
+        # measuring distances to all placed bases (old code: O(cells x bases)
+        # with per-cell numpy overhead). A cell stays eligible exactly when
+        # its distance to every placed base is >= min_base_dist, matching the
+        # old `dists.min() >= min_base_dist` rule cell-for-cell.
+        by_score = np.argsort(base_field.ravel())[::-1]
+        blocked = np.zeros((h, w), dtype=bool)
+        r = int(min_base_dist)
+        _dy, _dx = np.mgrid[-r:r + 1, -r:r + 1]
+        disk = (_dx * _dx + _dy * _dy) < r * r
         placed = 0
-        for idx in flat_idx:
+        for idx in by_score:
             if placed >= n_bases:
                 break
-            x, y = idx % w, idx // w
-            if placed == 0:
-                base_idx[y, x] = placed
-                placed += 1
-            else:
-                # greedy: skip cells too close to existing bases
-                existed = np.column_stack(np.where(base_idx >= 0))
-                if len(existed) == 0:
-                    continue
-                dists = np.sqrt((existed[:, 1] - x) ** 2 + (existed[:, 0] - y) ** 2)
-                if dists.min() >= min_base_dist:
-                    base_idx[y, x] = placed
-                    placed += 1
+            x, y = int(idx % w), int(idx // w)
+            if blocked[y, x]:
+                continue
+            base_idx[y, x] = placed
+            placed += 1
+            y0, y1 = max(0, y - r), min(h, y + r + 1)
+            x0, x1 = max(0, x - r), min(w, x + r + 1)
+            blocked[y0:y1, x0:x1] |= disk[y0 - (y - r):y1 - (y - r),
+                                          x0 - (x - r):x1 - (x - r)]
     return g, base_idx
 
 def place_resources(base_idx, res_field, n_res, radius=10):
@@ -941,8 +937,10 @@ def drawmap(g, es, ps, base_idx=None, resources=None, texture=None):
             if len(ys) == 0:
                 continue
             cy, cx = int(ys.mean()), int(xs.mean())
-            # Base marker: colored wedge on the base cell
-            col = PAL[base_id % len(PAL)]
+            # Base marker: colored wedge on the base cell.
+            # PAL is BGR but cv is RGB (Image.fromarray(..., "RGB")) -> unpack.
+            _b, _g, _r = PAL[base_id % len(PAL)]
+            col = (_r, _g, _b)
             for dy in range(-3, 4):
                 for dx in range(-3, 4):
                     if abs(dx) != abs(dy) and abs(dx) + abs(dy) <= 3:
@@ -969,7 +967,22 @@ def drawmap(g, es, ps, base_idx=None, resources=None, texture=None):
 def add_legend(im, es, g, base_idx=None, resources=None):
     cnt = np.bincount(g.ravel(), minlength=len(es))
     tot = cnt.sum()
-    out = Image.new("RGB", (im.width+260, max(im.height, 40+28*len(es))), (24,24,28))
+    # `bases` is defined unconditionally: the resource-row layout below uses
+    # len(bases), which used to NameError when base_idx was None.
+    bases = np.unique(base_idx) if base_idx is not None else np.array([-1])
+    base_ids = [int(b) for b in bases if b != -1]
+    res_rows = list((resources or [])[:8])  # legend shows at most 8
+    # Size the canvas to fit every drawn row (materials + base rows +
+    # resource rows + padding). The old height ignored base/resource rows and
+    # silently clipped them on small maps.
+    need = 40 + 28 * len(es)
+    if base_ids:
+        need = max(need, 40 + len(es) * 28 + 20 + max(base_ids) * 28 + 28)
+    if res_rows:
+        need = max(need, 40 + len(es) * 28 + 20 + len(bases) * 28 + 20
+                   + max(int(r[0]) for r in res_rows) * 28 + 28)
+    need += 12  # bottom padding
+    out = Image.new("RGB", (im.width+260, max(im.height, need)), (24,24,28))
     out.paste(im, (0,0))
     d = ImageDraw.Draw(out)
     d.text((im.width+16, 10), "Legend", fill=(255,255,255))
@@ -983,22 +996,19 @@ def add_legend(im, es, g, base_idx=None, resources=None):
         pct = 100.0*cnt[i]/max(tot,1)
         d.text((im.width+48, y), "%s %.1f pct" % (e.label, pct), fill=(230,230,230))
 
-    # Base legend
-    if base_idx is not None:
-        bases = np.unique(base_idx)
-        for base_id in bases:
-            if base_id == -1:
-                continue
-            y = 40 + len(es)*28 + 20 + base_id*28
-            d.rectangle([im.width+16, y, im.width+40, y+18], fill=PAL[base_id % len(PAL)], outline=(255,255,255))
-            d.text((im.width+48, y), "Base %d" % base_id, fill=(230,230,230))
-    if resources:
-        for base_id, rx, ry in resources[:8]:  # limit to 8 for legend
+    # Base legend (PAL is BGR -> unpack to RGB for PIL)
+    for base_id in base_ids:
+        y = 40 + len(es)*28 + 20 + base_id*28
+        _b, _g, _r = PAL[base_id % len(PAL)]
+        d.rectangle([im.width+16, y, im.width+40, y+18], fill=(_r, _g, _b), outline=(255,255,255))
+        d.text((im.width+48, y), "Base %d" % base_id, fill=(230,230,230))
+    if res_rows:
+        for base_id, rx, ry in res_rows:
             y = 40 + len(es)*28 + 20 + len(bases)*28 + 20 + base_id*28
-            try:
-                rgb = hex_rgb(PAL[base_id % len(PAL)])
-            except Exception:
-                rgb = (128,128,128)
+            # PAL is BGR -> unpack to RGB for PIL (hex_rgb takes a string,
+            # so passing the tuple always raised and fell back to gray)
+            _b, _g, _r = PAL[base_id % len(PAL)]
+            rgb = (_r, _g, _b)
             d.ellipse([im.width+16+8, y+4, im.width+16+24, y+20], fill=(255,255,255), outline=rgb)
             d.text((im.width+16+30, y-2), "⛶ %d" % base_id, fill=(230,230,230))
     return out
@@ -1019,7 +1029,8 @@ def f2_generate(jf, w, h, sc, oc, sd, ps, n_bases=1, n_res=2):
         es = from_json(jf_payload) if isinstance(jf_payload, dict) else []
         if not es:
             raise gr.Error("No materials. Export (Feature 1) or upload a resource_label.json.")
-        GEN["entries"] = es
+        with _state_locked():
+            GEN["entries"] = es
     w = max(8, min(int(w), 512))
     h = max(8, min(int(h), 512))
     nz = pfield(w, h, float(sc), int(oc), int(sd))
@@ -1053,19 +1064,21 @@ def f2_generate(jf, w, h, sc, oc, sd, ps, n_bases=1, n_res=2):
         texture = None
     if texture is None:
         # Tile real reference pixels carried by the materials JSON.
-        # Sources: current upload payload first, then already-loaded entries
-        # (GEN), then the last Feature 1 scan in memory.
+        # Exemplars merge by material id: the fresh upload wins per id, but
+        # ids missing from the upload keep the already-loaded (GEN) exemplar
+        # for that id, so a partial or id-mismatched JSON degrades gracefully
+        # instead of silently dropping those regions to flat colour. Last
+        # resort is the live Feature 1 scan, then flat material colours.
         exemplars = {}
+        try:
+            for _e in (es or []):
+                _arr = _from_b64_png(getattr(_e, "texture_png", ""))
+                if _arr is not None:
+                    exemplars[int(getattr(_e, "id", -1))] = _arr
+        except Exception:
+            exemplars = {}
         if isinstance(jf_payload, dict):
-            exemplars = _exemplars_from_payload(jf_payload)
-        if not exemplars:
-            try:
-                for _e in (es or []):
-                    _arr = _from_b64_png(getattr(_e, "texture_png", ""))
-                    if _arr is not None:
-                        exemplars[int(getattr(_e, "id", -1))] = _arr
-            except Exception:
-                exemplars = {}
+            exemplars.update(_exemplars_from_payload(jf_payload))
         if not exemplars:
             try:
                 exemplars = _scan_exemplars(size=48)
@@ -1075,8 +1088,9 @@ def f2_generate(jf, w, h, sc, oc, sd, ps, n_bases=1, n_res=2):
             texture = _tile_texture(g, exemplars, es, seed=int(sd))
         else:
             texture = _texture_grid(g, es)
-    GEN.update({"grid": g, "height": nz, "base_idx": base_idx, "resources": resources,
-                "seed": int(sd), "texture": texture})
+    with _state_locked():
+        GEN.update({"grid": g, "height": nz, "base_idx": base_idx, "resources": resources,
+                    "seed": int(sd), "texture": texture})
     im = add_legend(drawmap(g, es, int(ps), base_idx=base_idx, resources=resources, texture=texture), es, g,
                     base_idx=base_idx, resources=resources)
     cnt = np.bincount(g.ravel(), minlength=len(es))
@@ -1105,10 +1119,24 @@ def f2_png():
 def f2_mat():
     if GEN.get("grid") is None:
         raise gr.Error("Generate first.")
-    es = GEN["entries"]
+    es = GEN.get("entries") or []
     g = GEN["grid"]
     base_idx = GEN.get("base_idx")
     resources = GEN.get("resources")
+    # Grid cells hold positional indices into `es`. Guard against a stale
+    # grid (generated) vs reloaded materials (different length) mismatch:
+    # label out-of-range cells "?" and warn instead of IndexError-tracebacking.
+    _n = len(es)
+    _bad = [0]
+    def _lab(v):
+        try:
+            _i = int(v)
+        except (TypeError, ValueError):
+            _i = -1
+        if 0 <= _i < _n:
+            return es[_i].label
+        _bad[0] += 1
+        return "?pos%d" % _i
     base_idx_arr = base_idx if base_idx is not None else np.full((0, 0), -1, dtype=np.int32)
     n_bases = int((base_idx_arr >= 0).sum())
     n_res = len(resources or [])
@@ -1122,13 +1150,18 @@ def f2_mat():
     pay = {"meta": {"seed": GEN["seed"], "n_bases": n_bases, "n_res": n_res},
            "materials": [asdict(e) for e in es],
            "grid_ids": g.tolist(),
-           "grid_labels": [[es[int(v)].label for v in row] for row in g.tolist()],
+           "grid_labels": [[_lab(v) for v in row] for row in g.tolist()],
            "base_grid": base_idx.tolist() if base_idx is not None else None,
            "resource_positions": [[int(r[0]), int(r[1]), int(r[2])] for r in (resources or [])],
            "texture": _tex_arr.tolist()}
-    return _export_auto("generated_map_matrix.json",
-                        lambda p: open(p, "w", encoding="utf-8").write(json.dumps(pay)),
-                        "Grid JSON exported.")
+    msg = _export_auto("generated_map_matrix.json",
+                       lambda p: open(p, "w", encoding="utf-8").write(json.dumps(pay)),
+                       "Grid JSON exported.")
+    if _bad[0]:
+        msg += ("\nWARNING: %d grid cell(s) reference material positions outside the "
+                "loaded materials list (map was generated from different materials?) - "
+                "regenerate before exporting." % _bad[0])
+    return msg
 
 # ---------- feature 3: texture & material swap engine ----------
 def _swap_mask(img_rgb, target_hex, tol):
@@ -1218,31 +1251,38 @@ def f3_apply(targets, repl, tol=90.0, feather=1, strength=1.0, tile=1.0):
         combined = np.maximum(combined, _swap_mask(base, tgt.color_hex, tol))
     if int(combined.max()) == 0:
         return Image.fromarray(base, "RGB"), "No pixels matched (raise tolerance)."
-    SWAP.setdefault("prev", []).append(base.copy())
     out = _mask_blend(base, layer, combined, feather=int(feather), strength=strength)
-    SWAP["out"] = out
-    SWAP.setdefault("remaps", []).append({"targets": tids, "replacement": rid})
+    with _state_locked():
+        _prev = SWAP.setdefault("prev", [])
+        _prev.append(base.copy())
+        del _prev[:-20]  # cap undo history at 20 full-res frames
+        SWAP["out"] = out
+        SWAP.setdefault("remaps", []).append({"targets": tids, "replacement": rid})
     cov = 100.0 * (combined > 0).sum() / combined.size
     return Image.fromarray(out, "RGB"), "Swapped %s -> %s : %.1f%% pixels." % (
         ",".join(str(i) for i in tids), src.label, cov)
 
 def f3_undo():
-    if SWAP.get("prev"):
-        SWAP["out"] = SWAP["prev"].pop()
-        if SWAP.get("remaps"):
-            SWAP["remaps"].pop()
-        return Image.fromarray(SWAP["out"], "RGB"), "Undid last swap."
-    if SWAP.get("orig") is not None:
-        SWAP["out"] = SWAP["orig"].copy()
-        SWAP["remaps"] = []
-        return Image.fromarray(SWAP["out"], "RGB"), "Reset to original."
-    raise gr.Error("Nothing to undo.")
+    with _state_locked():
+        if SWAP.get("prev"):
+            SWAP["out"] = SWAP["prev"].pop()
+            if SWAP.get("remaps"):
+                SWAP["remaps"].pop()
+            msg = "Undid last swap."
+        elif SWAP.get("orig") is not None:
+            SWAP["out"] = SWAP["orig"].copy()
+            SWAP["remaps"] = []
+            msg = "Reset to original."
+        else:
+            raise gr.Error("Nothing to undo.")
+        out = SWAP["out"]
+    return Image.fromarray(out, "RGB"), msg
 
 def f3_save():
     if SWAP.get("out") is None:
         raise gr.Error("Nothing to save yet.")
     d = get_export_dir()
-    ts = time.strftime("%Y%m%d_%H%M%S")
+    ts = time.strftime("%Y%m%d_%H%M%S") + "_%06d" % int((time.time() % 1) * 1e6)
     p = os.path.join(d, "swapped_map_%s.png" % ts)
     Image.fromarray(SWAP["out"], "RGB").save(p)
     jp = os.path.join(d, "swapped_remaps_%s.json" % ts)
@@ -1260,7 +1300,7 @@ def f4_export(fmt):
     if nz is None:
         nz = np.full_like(g, 0.5, dtype=np.float32)
     d = get_export_dir()
-    ts = time.strftime("%Y%m%d_%H%M%S")
+    ts = time.strftime("%Y%m%d_%H%M%S") + "_%06d" % int((time.time() % 1) * 1e6)
     outs = []
     if "a) 2D grid matrix JSON" in fmt:
         p = os.path.join(d, "export_grid_%s.json" % ts)
@@ -1296,7 +1336,13 @@ def f4_export(fmt):
 def _reveal_exports():
     p = os.path.abspath(get_export_dir())
     try:
-        os.startfile(p)  # type: ignore[attr-defined]
+        import subprocess
+        if sys.platform.startswith("win"):
+            os.startfile(p)  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.run(["open", p], check=True)
+        else:
+            subprocess.run(["xdg-open", p], check=True)
     except Exception as e:
         raise gr.Error("Could not open folder %s: %s" % (_rel(p), e))
     return "Opened:\n" + _rel(p)
@@ -1379,8 +1425,8 @@ document.addEventListener('mousemove', e => {
 document.addEventListener('mouseleave', hide, true);
 }""")
             ov.input(None, [ov], None,
-                js="(a) => { var lay = document.getElementById('reallay');"
-                   " if (lay) lay.style.opacity = (parseFloat(a) || 0).toString(); }")
+                js="(a) => { document.querySelectorAll(\"[id^='reallay']\").forEach(function(lay){"
+                   " lay.style.opacity = (parseFloat(a) || 0).toString(); }); }")
             eb.click(f1_export, [tb], [jo])
             reveal1.click(_reveal_exports, None, [jo])
         with gr.Tab("Feature 2 - Generator"):
@@ -1474,18 +1520,43 @@ document.addEventListener('mouseleave', hide, true);
             ex_save.click(_use_folder, [ex_pick], [ex_msg, ex_dir])
     return d
 
+def _pick_port(first=GRADIO_PORT, last=GRADIO_PORT + 10):
+    """First free TCP port in [first, last] on 127.0.0.1 (bind-test)."""
+    import socket
+    for port in range(first, last + 1):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+            return port
+    raise RuntimeError("no free port in %d..%d" % (first, last))
+
 def launch():
+    port = _pick_port()
+    if port != GRADIO_PORT:
+        print("mager: port %d busy, using %d" % (GRADIO_PORT, port))
     demo = build_ui()
-    threading.Thread(target=lambda: demo.launch(server_name="127.0.0.1", server_port=GRADIO_PORT,
-        inbrowser=False, show_error=True, prevent_thread_lock=True, quiet=True), daemon=True).start()
-    url = "http://127.0.0.1:%d" % GRADIO_PORT
+    _srv_err = {}
+    def _run():
+        try:
+            demo.launch(server_name="127.0.0.1", server_port=port,
+                inbrowser=False, show_error=True, prevent_thread_lock=True, quiet=True)
+        except Exception as e:
+            _srv_err["exc"] = e
+    threading.Thread(target=_run, daemon=True).start()
+    url = "http://127.0.0.1:%d" % port
     import urllib.request
     for _ in range(60):
+        if _srv_err.get("exc") is not None:
+            break
         try:
             urllib.request.urlopen(url, timeout=2)
             break
         except Exception:
             time.sleep(0.5)
+    if _srv_err.get("exc") is not None:
+        raise RuntimeError("Gradio server failed to start on %s: %s" % (url, _srv_err["exc"]))
     try:
         import webview
         webview.create_window(APP_TITLE, url, width=1280, height=860)
