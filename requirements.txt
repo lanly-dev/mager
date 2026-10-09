@@ -1,6 +1,7 @@
-gradio>=4.0.0
-pywebview>=4.4.0
-opencv-python>=4.8.0
-numpy>=1.24.0
-perlin-noise>=1.13
-Pillow>=10.0.0
+# NOTE: on Linux, pywebview needs system WebKitGTK (pip cannot provide it).
+gradio>=4.0.0,<6
+pywebview>=4.4.0,<6
+opencv-python>=4.8.0,<5
+numpy>=1.24.0,<3
+perlin-noise>=1.13,<2
+Pillow>=10.0.0,<12
