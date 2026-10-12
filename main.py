@@ -1677,21 +1677,41 @@ def _reveal_exports():
         raise gr.Error("Could not open folder %s: %s" % (_rel(p), e))
     return "Opened:\n" + _rel(p)
 
+# ─── Compact UI ──────────────────────────────────────────────────────────
+# The app runs in a 1280x860 pywebview window; the default Gradio Soft theme
+# spacing makes every tab scroll. These structural choices (two-column
+# control grids, merged button rows, accordions for secondary actions) plus
+# a little CSS keep each tab on one screen. Image caps use elem_id selectors
+# (stable across Gradio versions, unlike theme class names).
+COMPACT_CSS = """
+.gradio-container { max-width: 1280px !important; }
+footer { display: none !important; }
+/* Keep big previews from blowing out their columns. */
+#genmap img, #swapout img, #scanimg img {
+    max-height: 42vh !important;
+    object-fit: contain !important;
+}
+/* Tighter section headers. */
+.gradio-container h3 { margin: 4px 0 !important; }
+"""
+
 def build_ui():
-    with gr.Blocks(title=APP_TITLE, theme=gr.themes.Soft()) as d:
-        gr.Markdown("# " + APP_TITLE + " - offline Tab1 scan, Tab2 generate")
+    with gr.Blocks(title=APP_TITLE, theme=gr.themes.Soft(), css=COMPACT_CSS) as d:
+        gr.Markdown("### " + APP_TITLE)
         with gr.Tab("Feature 1 - Scan"):
             with gr.Row():
                 with gr.Column():
                     im = gr.Image(type="numpy", label="Upload or paste image (click to browse, drag-drop, or Ctrl+V)",
-                                  sources=["upload", "clipboard"])
-                    kk = gr.Slider(2, 12, value=5, step=1, label="Colors (K)")
+                                  sources=["upload", "clipboard"], elem_id="scanimg")
+                    with gr.Row():
+                        kk = gr.Slider(2, 12, value=5, step=1, label="Colors (K)")
+                        mp = gr.Slider(3, 15, value=7, step=2, label="Cleanup size (bigger = more solid lumps)")
+                    with gr.Row():
+                        ma = gr.Slider(0, 5000, value=400, step=50, label="Min lump area px (pattern/object mode)")
+                        mg = gr.Slider(0.3, 3.0, value=1.0, step=0.1,
+                            label="Pattern merge strength (higher = fewer, bigger groups)")
                     md = gr.Radio(["Pattern groups", "Object lumps", "Color lumps"], value="Pattern groups",
                         label="Segment mode")
-                    mp = gr.Slider(3, 15, value=7, step=2, label="Cleanup size (bigger = more solid lumps)")
-                    ma = gr.Slider(0, 5000, value=400, step=50, label="Min lump area px (pattern/object mode)")
-                    mg = gr.Slider(0.3, 3.0, value=1.0, step=0.1,
-                        label="Pattern merge strength (higher = fewer, bigger groups)")
                     sb = gr.Button("Scan Image", variant="primary")
                 with gr.Column():
                     so = gr.HTML(value=_empty_view(), label="Segmented (tint + real-map overlay)")
@@ -1704,11 +1724,9 @@ def build_ui():
                 col_count=(7, "fixed"), interactive=True, wrap=True, label="Segments (hover any row for spotlight minimap)",
                 elem_id="segtable")
             with gr.Row():
-                eb = gr.Button("💾 Save resource_label.json", variant="primary")
-            with gr.Row():
-                jo = gr.Textbox(label="Saved file path", interactive=False, show_copy_button=True)
-            with gr.Row():
-                reveal1 = gr.Button("📁 Open export folder")
+                eb = gr.Button("💾 Save resource_label.json", variant="primary", scale=2)
+                jo = gr.Textbox(label="Saved file path", interactive=False, show_copy_button=True, scale=3)
+                reveal1 = gr.Button("📁 Open export folder", scale=1)
             sb.click(f1_scan, [im, kk, md, mp, ma, ov, mg], [so, tb, st])
             d.load(None, None, None, js="""() => {
 if (window.__segHover) return; window.__segHover = true;
@@ -1762,32 +1780,36 @@ document.addEventListener('mouseleave', hide, true);
         with gr.Tab("Feature 2 - Generator"):
             with gr.Row():
                 with gr.Column():
-                    jf = gr.File(label="resource_label.json", file_types=[".json"])
-                    lb = gr.Button("Load Materials")
-                    mi = gr.Textbox(label="Materials", lines=6, interactive=False)
-                    wi = gr.Slider(16, 512, value=128, step=8, label="Width")
-                    hi = gr.Slider(16, 512, value=128, step=8, label="Height")
-                    sc = gr.Slider(0.5, 20.0, value=5.0, step=0.5, label="Scale")
-                    oc = gr.Slider(1, 8, value=4, step=1, label="Octaves")
-                    sd = gr.Number(value=0, label="Seed", precision=0)
-                    ps = gr.Slider(1, 16, value=4, step=1, label="Pixel scale")
-                    nb = gr.Slider(1, 8, value=1, step=1, label="Bases count")
-                    nr = gr.Slider(1, 4, value=2, step=1, label="Resources per base")
+                    with gr.Row():
+                        jf = gr.File(label="resource_label.json", file_types=[".json"], scale=3)
+                        lb = gr.Button("Load Materials", scale=1)
+                    mi = gr.Textbox(label="Materials", lines=3, interactive=False)
+                    with gr.Row():
+                        with gr.Column():
+                            wi = gr.Slider(16, 512, value=128, step=8, label="Width")
+                            sc = gr.Slider(0.5, 20.0, value=5.0, step=0.5, label="Scale")
+                            ps = gr.Slider(1, 16, value=4, step=1, label="Pixel scale")
+                            nb = gr.Slider(1, 8, value=1, step=1, label="Bases count")
+                        with gr.Column():
+                            hi = gr.Slider(16, 512, value=128, step=8, label="Height")
+                            oc = gr.Slider(1, 8, value=4, step=1, label="Octaves")
+                            sd = gr.Number(value=0, label="Seed", precision=0)
+                            nr = gr.Slider(1, 4, value=2, step=1, label="Resources per base")
                     tp = gr.Dropdown(choices=TEMPLATE_CHOICES, value="Freeform",
                                      label="Layout template (templates are 1v1: symmetric bases/resources)")
                     with gr.Row():
                         gb = gr.Button("Generate", variant="primary")
                         rb = gr.Button("Regenerate")
                 with gr.Column():
-                    mo = gr.Image(label="Map plus legend")
+                    mo = gr.Image(label="Map plus legend", elem_id="genmap")
                     ss = gr.Textbox(label="Stats", interactive=False)
-                    with gr.Row():
-                        pb = gr.Button("💾 Save PNG")
-                        mb = gr.Button("💾 Save grid JSON")
-                    with gr.Row():
-                        po = gr.Textbox(label="Saved PNG path", interactive=False, show_copy_button=True)
-                        mo2 = gr.Textbox(label="Saved grid JSON path", interactive=False, show_copy_button=True)
-                    with gr.Row():
+                    with gr.Accordion("Save files", open=False):
+                        with gr.Row():
+                            pb = gr.Button("💾 Save PNG")
+                            mb = gr.Button("💾 Save grid JSON")
+                        with gr.Row():
+                            po = gr.Textbox(label="Saved PNG path", interactive=False, show_copy_button=True)
+                            mo2 = gr.Textbox(label="Saved grid JSON path", interactive=False, show_copy_button=True)
                         reveal2 = gr.Button("📁 Open export folder")
             lb.click(lambda f: load_entries(f)[1], [jf], [mi])
             gb.click(f2_generate, [jf, wi, hi, sc, oc, sd, ps, nb, nr, tp], [mo, ss])
@@ -1805,15 +1827,17 @@ document.addEventListener('mouseleave', hide, true);
             sw_targets = gr.CheckboxGroup(label="Target materials to replace (masks)", choices=[], value=[])
             sw_repl = gr.Dropdown(label="Replacement texture (material exemplar)", choices=[], value=None)
             with gr.Row():
-                sw_tol = gr.Slider(10, 250, value=90, step=1, label="Colour tolerance")
-                sw_feather = gr.Slider(0, 8, value=1, step=1, label="Edge feather")
-                sw_strength = gr.Slider(0.1, 1.0, value=1.0, step=0.05, label="Blend strength")
-                sw_tile = gr.Slider(0.25, 4.0, value=1.0, step=0.25, label="Texture scale")
+                with gr.Column():
+                    sw_tol = gr.Slider(10, 250, value=90, step=1, label="Colour tolerance")
+                    sw_strength = gr.Slider(0.1, 1.0, value=1.0, step=0.05, label="Blend strength")
+                with gr.Column():
+                    sw_feather = gr.Slider(0, 8, value=1, step=1, label="Edge feather")
+                    sw_tile = gr.Slider(0.25, 4.0, value=1.0, step=0.25, label="Texture scale")
             with gr.Row():
                 sw_apply = gr.Button("Apply swap", variant="primary")
                 sw_undo = gr.Button("Undo / Reset")
                 sw_save = gr.Button("Save result")
-            sw_out = gr.Image(label="Re-textured result")
+            sw_out = gr.Image(label="Re-textured result", elem_id="swapout")
             sw_msg = gr.Textbox(label="Swap log")
             sw_load.click(f3_upload, [sw_img, sw_json], [sw_out, sw_targets, sw_repl, sw_msg])
             sw_apply.click(f3_apply, [sw_targets, sw_repl, sw_tol, sw_feather, sw_strength, sw_tile], [sw_out, sw_msg])
