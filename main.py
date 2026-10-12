@@ -836,6 +836,232 @@ def pfield(w, h, scale, octv, seed):
         return (f-mn)/(mx-mn)
     return np.full_like(f, 0.5)
 
+def _eval_noise_2d(pn, X, Y):
+    """Evaluate pn.noise at each cell of the 2D coordinate arrays X, Y."""
+    noise = pn.noise  # hoisted: skip __call__ dispatch per cell
+    ch, cw = X.shape
+    f = np.zeros((ch, cw))
+    for j in range(ch):
+        Xr, Yr, row = X[j], Y[j], f[j]
+        for i in range(cw):
+            row[i] = noise([Xr[i], Yr[i]])
+    return f
+
+def _fbm_2d(pn, X, Y, octaves):
+    """True fBm: per-octave 2x frequency / 0.5x amplitude sum of pn."""
+    total = np.zeros_like(X); norm = 0.0
+    amp, freq = 1.0, 1.0
+    for _ in range(max(1, int(octaves))):
+        total += amp * _eval_noise_2d(pn, X * freq, Y * freq)
+        norm += amp
+        amp *= 0.5; freq *= 2.0
+    return total / norm
+
+def _fbm_ridged_2d(pn, X, Y, octaves):
+    """(fbm, ridged) grids sharing one set of per-octave samples.
+
+    Ridged multifractal: sum of amp * (1 - |n|)^2 per octave - the crease at
+    each octave's zero crossings is what reads as sharp mountain crests.
+    Accumulating both sums in one octave loop halves the noise cost."""
+    fbm = np.zeros_like(X); rgd = np.zeros_like(X); norm = 0.0
+    amp, freq = 1.0, 1.0
+    for _ in range(max(1, int(octaves))):
+        n = _eval_noise_2d(pn, X * freq, Y * freq)
+        fbm += amp * n
+        rgd += amp * (1.0 - np.abs(n)) ** 2
+        norm += amp
+        amp *= 0.5; freq *= 2.0
+    return fbm / norm, rgd / norm
+
+def _norm01(f):
+    mn, mx = f.min(), f.max()
+    if mx > mn:
+        return (f - mn) / (mx - mn)
+    return np.full_like(f, 0.5)
+
+def terrain_field(w, h, scale, octv, seed, warp=0.5, ridge=0.4):
+    """Warpped + ridged true-fBm heightfield, normalized [0, 1].
+
+    Why this exists: the `perlin-noise` package's `octaves` parameter is only
+    a frequency multiplier (verified: PerlinNoise(octaves=4).noise([x, y]) ==
+    PerlinNoise(octaves=1).noise([4*x, 4*y])), so `pfield` never summed real
+    detail octaves - a big reason generated maps look blobby. This builds a
+    real fBm, domain-warps the sample coordinates (Quilez-style: breaks up the
+    blobby look), and mixes in a ridged multifractal for mountain chains.
+
+    warp=0 and ridge=0 delegates to pfield for bit-exact legacy output.
+    Deterministic per (w, h, scale, octv, seed, warp, ridge).
+    """
+    if warp <= 0 and ridge <= 0:
+        return pfield(w, h, scale, octv, seed)
+    warp = max(0.0, min(1.0, float(warp)))
+    ridge = max(0.0, min(1.0, float(ridge)))
+    div = 1
+    while (w // div) * (h // div) > 65536 and div < 8:
+        div *= 2
+    cw, ch = max(1, w // div), max(1, h // div)
+    xs = np.linspace(0, float(scale), cw)
+    ys = np.linspace(0, float(scale), ch)
+    X0, Y0 = np.meshgrid(xs, ys)
+    s = int(seed)
+    # Decorrelated warp samplers (golden-ratio hash of the seed).
+    ws1 = (s ^ 0x9E3779B9) & 0x7FFFFFFF or 1
+    ws2 = (s ^ 0x85EBCA6B) & 0x7FFFFFFF or 1
+    # Warp offsets: 2-octave fBm is all warping needs (it is low-frequency).
+    qx = _fbm_2d(PerlinNoise(octaves=1, seed=ws1), X0, Y0, 2)
+    qy = _fbm_2d(PerlinNoise(octaves=1, seed=ws2), X0, Y0, 2)
+    wamp = warp * float(scale) * 0.35
+    Xw, Yw = X0 + wamp * qx, Y0 + wamp * qy
+    # Main field on warped coords; fbm + ridged share the octave samples.
+    fbm, rgd = _fbm_ridged_2d(PerlinNoise(octaves=1, seed=s), Xw, Yw, octv)
+    out = (1.0 - ridge) * _norm01(fbm) + ridge * _norm01(rgd)
+    if div > 1:
+        out = cv2.resize(out, (w, h), interpolation=cv2.INTER_CUBIC)
+    return _norm01(out).astype(np.float32)
+
+# ─── Hydraulic erosion (droplet simulation) ────────────────────────────
+# Vectorized port of the Sebastian Lague / Hans Beyer droplet algorithm:
+# droplets spawn at random cells, flow downhill under inertia, pick up
+# sediment where they accelerate and deposit it where they slow down or
+# climb. Erosion scatters over a small brush (wide valleys); deposition uses
+# a tight bilinear splat (fills pits). Reference:
+# https://github.com/SebLague/Hydraulic-Erosion (MIT)
+#
+# The reference updates droplet speed as sqrt(speed^2 + deltaHeight*gravity),
+# which counterintuitively DEcelerates droplets moving downhill
+# (deltaHeight < 0 there). That deceleration is load-bearing for the
+# parameter tuning: it keeps sediment capacity from outrunning sediment
+# load, so the capacity constraint - not the deltaHeight clamp - limits the
+# erosion rate. That is what carves channels instead of planing slopes
+# flat (verified empirically: an accelerating "physical" speed update planed
+# a test field flat, relief 0.0856 -> 0.0033). Only change vs the reference
+# is a max(0, ...) guard against sqrt-of-negative on extreme cliffs.
+
+def _erosion_brush_offsets(radius):
+    kr = np.arange(-radius, radius + 1)
+    dy, dx = np.meshgrid(kr, kr, indexing="ij")
+    w = np.maximum(0.0, 1.0 - np.sqrt(dx * dx + dy * dy) / float(radius))
+    w /= w.sum()
+    return [(int(yy), int(xx), float(ww))
+            for yy, xx, ww in zip(dy.ravel(), dx.ravel(), w.ravel()) if ww > 0]
+
+def droplet_erosion(h, seed, droplets=12000, radius=2, inertia=0.05,
+                    capacity_factor=4.0, min_slope=0.01, erode_speed=0.3,
+                    deposit_speed=0.3, evaporate=0.01, gravity=4.0,
+                    max_lifetime=30, batch=4096):
+    """Carve h (2D float array, ~[0, 1]) with droplet hydraulic erosion.
+
+    Vectorized over droplets (Beyer/Lague per-droplet dynamics preserved).
+    Deterministic per (h, seed, params). Returns float32 in [0, 1].
+    droplets=0 is a pass-through.
+    """
+    h = np.asarray(h, dtype=np.float64)
+    if droplets <= 0:
+        return _norm01(h).astype(np.float32)
+    H, W = h.shape
+    pad = int(radius) + 1
+    hp = np.pad(h, pad, mode="edge")
+    offs = _erosion_brush_offsets(int(radius))
+    rng = np.random.default_rng(int(seed))
+    droplets = int(droplets)
+
+    for start in range(0, droplets, batch):
+        n = min(batch, droplets - start)
+        # Droplet state, in padded coordinates.
+        px = rng.random(n) * (W - 1) + pad
+        py = rng.random(n) * (H - 1) + pad
+        dx = np.zeros(n); dy = np.zeros(n)
+        speed = np.ones(n); water = np.ones(n); sed = np.zeros(n)
+        alive = np.ones(n, dtype=bool)
+        for _ in range(int(max_lifetime)):
+            idx = np.nonzero(alive)[0]
+            if idx.size == 0:
+                break
+            # Integer node + fractional offset at the current (old) position.
+            nx = np.floor(px[idx]).astype(np.int64)
+            ny = np.floor(py[idx]).astype(np.int64)
+            fx = px[idx] - nx; fy = py[idx] - ny
+            # Bilinear height + gradient.
+            h00 = hp[ny, nx];     h10 = hp[ny, nx + 1]
+            h01 = hp[ny + 1, nx]; h11 = hp[ny + 1, nx + 1]
+            gx = (h10 - h00) * (1 - fy) + (h11 - h01) * fy
+            gy = (h01 - h00) * (1 - fx) + (h11 - h10) * fx
+            hh = (h00 * (1 - fx) * (1 - fy) + h10 * fx * (1 - fy) +
+                  h01 * (1 - fx) * fy + h11 * fx * fy)
+            # Steer downhill with inertia; move one unit per step.
+            ddx = dx[idx] * inertia - gx * (1 - inertia)
+            ddy = dy[idx] * inertia - gy * (1 - inertia)
+            lens = np.sqrt(ddx * ddx + ddy * ddy)
+            moving = lens > 1e-9
+            ddx[moving] /= lens[moving]; ddy[moving] /= lens[moving]
+            npx = px[idx] + ddx; npy = py[idx] + ddy
+            # Die outside the brush margin (padded field absorbs the rest).
+            ok = (npx >= pad) & (npx < pad + W - 1) & (npy >= pad) & (npy < pad + H - 1)
+            # New height at the new position.
+            cx = np.clip(np.floor(npx).astype(np.int64), 0, W + 2 * pad - 2)
+            cy = np.clip(np.floor(npy).astype(np.int64), 0, H + 2 * pad - 2)
+            cfx = np.clip(npx - np.floor(npx), 0, 1); cfy = np.clip(npy - np.floor(npy), 0, 1)
+            q00 = hp[cy, cx];     q10 = hp[cy, cx + 1]
+            q01 = hp[cy + 1, cx]; q11 = hp[cy + 1, cx + 1]
+            nh = (q00 * (1 - cfx) * (1 - cfy) + q10 * cfx * (1 - cfy) +
+                  q01 * (1 - cfx) * cfy + q11 * cfx * cfy)
+            dh = nh - hh
+            cap = np.maximum(-dh * speed[idx] * water[idx] * capacity_factor, min_slope)
+            s = sed[idx]
+            # --- Deposit: over capacity or moving uphill. Tight bilinear splat.
+            dep = (s > cap) | (dh > 0)
+            if np.any(dep):
+                di = idx[dep]
+                amt = np.where(dh[dep] > 0,
+                               np.minimum(dh[dep], s[dep]),
+                               (s[dep] - cap[dep]) * deposit_speed)
+                amt = np.maximum(amt, 0.0)
+                sed[di] -= amt
+                w00 = (1 - fx[dep]) * (1 - fy[dep]); w10 = fx[dep] * (1 - fy[dep])
+                w01 = (1 - fx[dep]) * fy[dep];       w11 = fx[dep] * fy[dep]
+                np.add.at(hp, (ny[dep], nx[dep]), amt * w00)
+                np.add.at(hp, (ny[dep], nx[dep] + 1), amt * w10)
+                np.add.at(hp, (ny[dep] + 1, nx[dep]), amt * w01)
+                np.add.at(hp, (ny[dep] + 1, nx[dep] + 1), amt * w11)
+            # --- Erode: under capacity and moving downhill. Brush scatter.
+            ero = ~dep
+            if np.any(ero):
+                ei = idx[ero]
+                amt = np.minimum((cap[ero] - s[ero]) * erode_speed, -dh[ero])
+                amt = np.maximum(amt, 0.0)
+                sed[ei] += amt
+                for oy, ox, wgt in offs:
+                    np.add.at(hp, (ny[ero] + oy, nx[ero] + ox), -amt * wgt)
+            # --- Speed / water update; commit movement.
+            # NOTE: matches the reference exactly (decelerates downhill -
+            # see the header comment for why that is load-bearing).
+            speed[idx] = np.sqrt(np.maximum(0.0, speed[idx] ** 2 + dh * gravity))
+            water[idx] *= (1 - evaporate)
+            px[idx] = npx; py[idx] = npy; dx[idx] = ddx; dy[idx] = ddy
+            alive[idx[~ok | ~moving]] = False
+    out = hp[pad:pad + H, pad:pad + W]
+    return _norm01(np.clip(out, 0.0, None)).astype(np.float32)
+
+def thermal_erosion(h, iterations=3, talus=0.02, rate=0.25):
+    """Talus-angle relaxation: where a cell stands more than `talus` above a
+    neighbor, slide material downhill. Cheap cliff-softener that pairs with
+    droplet erosion. Deterministic. Returns float32 in [0, 1]."""
+    h = np.asarray(h, dtype=np.float64)
+    if iterations <= 0:
+        return _norm01(h).astype(np.float32)
+    hp = np.pad(h, 1, mode="edge")
+    for _ in range(int(iterations)):
+        c = hp[1:-1, 1:-1]
+        out = np.zeros_like(c)
+        for nb in (hp[:-2, 1:-1], hp[2:, 1:-1], hp[1:-1, :-2], hp[1:-1, 2:]):
+            out += np.maximum(0.0, (c - nb) - talus) * rate
+        # Inflow: neighbors' outflow toward me (zero-padded, no wraparound).
+        outp = np.pad(out, 1)
+        inflow = (outp[:-2, 1:-1] + outp[2:, 1:-1] +
+                  outp[1:-1, :-2] + outp[1:-1, 2:]) * 0.25
+        c += inflow - out
+    return _norm01(np.clip(hp[1:-1, 1:-1], 0.0, None)).astype(np.float32)
+
 def domap(nz, es, base_field=None, n_bases=1, min_base_dist=30):
     order = sorted(range(len(es)), key=lambda k: es[k].threshold, reverse=True)
     g = np.full(nz.shape, order[-1], dtype=np.int32)
@@ -1121,7 +1347,8 @@ def add_legend(im, es, g, base_idx=None, resources=None):
             d.text((im.width+16+30, y-2), "⛶ %d" % base_id, fill=(230,230,230))
     return out
 
-def f2_generate(jf, w, h, sc, oc, sd, ps, n_bases=1, n_res=2, template="Freeform"):
+def f2_generate(jf, w, h, sc, oc, sd, ps, n_bases=1, n_res=2, template="Freeform",
+                warp=0.5, ridge=0.4, erosion=0.5):
     # Materials: reuse what is already loaded, otherwise read the upload.
     # NOTE: the JSON payload is *always* inspected when an upload is given,
     # so a `texture` carried by the JSON reaches the generator even when
@@ -1141,7 +1368,9 @@ def f2_generate(jf, w, h, sc, oc, sd, ps, n_bases=1, n_res=2, template="Freeform
             GEN["entries"] = es
     w = max(8, min(int(w), 512))
     h = max(8, min(int(h), 512))
-    nz = pfield(w, h, float(sc), int(oc), int(sd))
+    # Warped + ridged true-fBm terrain (the "terrible map" fix: plain fBm is
+    # blobby; domain warping + ridged octaves + droplet erosion carve it).
+    nz = terrain_field(w, h, float(sc), int(oc), int(sd), warp=warp, ridge=ridge)
     key = _template_key(template)
 
     if key != "freeform":
@@ -1155,6 +1384,22 @@ def f2_generate(jf, w, h, sc, oc, sd, ps, n_bases=1, n_res=2, template="Freeform
         # Base placement: low-freq noise, greedy spacing
         base_field = pfield(w, h, float(sc) * 2.0, 3, int(sd))
         g, base_idx = domap(nz, es, base_field=base_field, n_bases=n_bases, min_base_dist=30)
+
+    # Carve the shaped field BEFORE pad flattening so build pads stay level.
+    # Erosion seed is decorrelated from the noise seed; the slider maps to
+    # droplet density (0 = skip entirely). Density scales with map area so
+    # the carving strength is consistent across sizes (~0.5 droplets/cell
+    # at full slider; verified: 0.4/cell carves clean valleys, 1.6/cell
+    # over-smooths).
+    if float(erosion) > 0:
+        cells = nz.shape[0] * nz.shape[1]
+        nz = droplet_erosion(nz, int(sd) ^ 0x51ED,
+                            droplets=int(float(erosion) * cells * 0.5))
+        nz = thermal_erosion(nz, iterations=3)
+        if key != "freeform":
+            # Templates promise mirrored terrain for 1v1 fairness; droplet
+            # erosion is not symmetric, so re-mirror (same as template shaping).
+            nz = (nz + nz[:, ::-1]) * 0.5
 
     # Flattened build pads at every base, in every mode (baked into the
     # exported heightmap, so consumers get level build sites for free).
@@ -1225,11 +1470,14 @@ def f2_generate(jf, w, h, sc, oc, sd, ps, n_bases=1, n_res=2, template="Freeform
     parts = ["%s:%.1f pct" % (es[k].label, 100.0*cnt[k]/tot) for k in range(len(es))]
     base_str = ", ".join(["B%d:%d" % (b, (base_idx==b).sum()) for b in np.unique(base_idx) if b >= 0])
     res_str = ", ".join(["B%d:%d" % (b, sum(1 for r in resources if r[0]==b)) for b in np.unique(base_idx) if b >= 0])
-    st = "Seed=%s %dx%d [%s] | Bases: %s | Res: %s | " % (sd, w, h, key, base_str, res_str) + ", ".join(parts)
+    st = "Seed=%s %dx%d [%s] warp=%.2f ridge=%.2f ero=%.2f | Bases: %s | Res: %s | " % (
+        sd, w, h, key, float(warp), float(ridge), float(erosion), base_str, res_str) + ", ".join(parts)
     return np.array(im), st
 
-def f2_regen(jf, w, h, sc, oc, ps, nb=1, nr=2, template="Freeform"):
-    return f2_generate(jf, w, h, sc, oc, random.randint(0, 999999), ps, nb, nr, template)
+def f2_regen(jf, w, h, sc, oc, ps, nb=1, nr=2, template="Freeform",
+             warp=0.5, ridge=0.4, erosion=0.5):
+    return f2_generate(jf, w, h, sc, oc, random.randint(0, 999999), ps, nb, nr,
+                       template, warp, ridge, erosion)
 
 def f2_png():
     if GEN.get("grid") is None:
@@ -1793,6 +2041,9 @@ document.addEventListener('mouseleave', hide, true);
                         with gr.Column():
                             hi = gr.Slider(16, 512, value=128, step=8, label="Height")
                             oc = gr.Slider(1, 8, value=4, step=1, label="Octaves")
+                            twarp = gr.Slider(0.0, 1.0, value=0.5, step=0.05, label="Warp (domain warp)")
+                            tridge = gr.Slider(0.0, 1.0, value=0.4, step=0.05, label="Ridges (mountain chains)")
+                            tero = gr.Slider(0.0, 1.0, value=0.5, step=0.05, label="Erosion (droplet carving)")
                             sd = gr.Number(value=0, label="Seed", precision=0)
                             nr = gr.Slider(1, 4, value=2, step=1, label="Resources per base")
                     tp = gr.Dropdown(choices=TEMPLATE_CHOICES, value="Freeform",
@@ -1812,8 +2063,8 @@ document.addEventListener('mouseleave', hide, true);
                             mo2 = gr.Textbox(label="Saved grid JSON path", interactive=False, show_copy_button=True)
                         reveal2 = gr.Button("📁 Open export folder")
             lb.click(lambda f: load_entries(f)[1], [jf], [mi])
-            gb.click(f2_generate, [jf, wi, hi, sc, oc, sd, ps, nb, nr, tp], [mo, ss])
-            rb.click(f2_regen, [jf, wi, hi, sc, oc, ps, nb, nr, tp], [mo, ss])
+            gb.click(f2_generate, [jf, wi, hi, sc, oc, sd, ps, nb, nr, tp, twarp, tridge, tero], [mo, ss])
+            rb.click(f2_regen, [jf, wi, hi, sc, oc, ps, nb, nr, tp, twarp, tridge, tero], [mo, ss])
             pb.click(f2_png, None, [po])
             mb.click(f2_mat, None, [mo2])
             reveal2.click(_reveal_exports, None, [mo2])
