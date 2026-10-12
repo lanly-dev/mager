@@ -898,6 +898,114 @@ def place_resources(base_idx, res_field, n_res, radius=10):
             count += 1
     return resources
 
+# ─── RTS layout templates ──────────────────────────────────────────────
+# Freeform scatters noise and greedily places bases wherever the base field
+# peaks. Real RTS maps are designed: symmetric base slots, fair resources,
+# and deliberate landforms (chokepoints, islands, contested high ground).
+# Templates shape the height field and place bases/resources symmetrically
+# across the vertical center axis, so 1v1 maps are fair by construction.
+# Everything here works on the normalized [0, 1] noise field and feeds the
+# existing export path unchanged (heightmap PNG, bases, resources).
+
+TEMPLATE_CHOICES = ["Freeform", "1v1 Mirror", "Islands", "Canyon"]
+
+def _template_key(label):
+    s = str(label or "").strip().lower()
+    if s.startswith("1v1") or s.startswith("mirror"):
+        return "mirror"
+    if s.startswith("island"):
+        return "islands"
+    if s.startswith("canyon"):
+        return "canyon"
+    return "freeform"
+
+def apply_template_height(nz, key, seed):
+    """Shape the noise field per template; result stays in [0, 1].
+
+    All non-freeform templates are mirrored across the center column for
+    1v1 fairness (averaging with the horizontal flip)."""
+    h, w = nz.shape
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float64)
+    if key == "mirror":
+        # Twin basins: gentle contested hill at the center.
+        d = np.hypot(xx - w / 2.0, yy - h / 2.0) / (0.35 * min(w, h))
+        nz = nz + 0.25 * np.exp(-d * d)
+    elif key == "islands":
+        # Two landmasses separated by a low basin (reads as shoreline in the
+        # game: low flats render damp/dark via the consumer's terrain colors).
+        isl = np.zeros_like(nz)
+        for cx, cy in ((0.25 * w, 0.5 * h), (0.75 * w, 0.5 * h)):
+            d = np.hypot(xx - cx, yy - cy) / (0.30 * min(w, h))
+            isl = np.maximum(isl, np.exp(-d * d * 1.5))
+        nz = nz * 0.35 + isl * 0.65
+        dmid = np.abs(xx - w / 2.0) / (0.12 * w)
+        nz = nz - 0.35 * np.exp(-dmid * dmid)
+    elif key == "canyon":
+        # North-south rift with two bridge crossings: natural chokepoints.
+        band = np.abs(xx - w / 2.0) / (0.10 * w)
+        carve = 0.55 * np.exp(-band * band)
+        for bz in (0.30 * h, 0.70 * h):
+            bd = np.abs(yy - bz) / (0.06 * h)
+            carve = carve * (1.0 - np.exp(-bd * bd))
+        nz = nz - carve
+    if key != "freeform":
+        nz = (nz + nz[:, ::-1]) * 0.5
+    return np.clip(nz, 0.0, 1.0)
+
+def template_base_cells(w, h, key):
+    """Symmetric 1v1 base slots as (cell_x, cell_y).
+
+    The east slot is the exact horizontal mirror of the west slot
+    (x -> w-1-x), so pads, resources and exports stay bit-symmetric even
+    for even widths, where int(0.75*w) != mirror(int(0.25*w))."""
+    if key == "islands":
+        xw = int(0.25 * w)
+    else:  # mirror / canyon: west/east, vertically centered
+        xw = int(0.22 * w)
+    xw = min(max(xw, 2), w - 3)
+    xe = w - 1 - xw
+    y = min(max(int(0.5 * h), 2), h - 3)
+    return [(xw, y), (xe, y)]
+
+def place_bases_direct(w, h, positions):
+    """base_idx array from explicit cell positions (no greedy search)."""
+    base_idx = np.full((h, w), -1, dtype=np.int32)
+    for i, (x, y) in enumerate(positions):
+        base_idx[int(y), int(x)] = i
+    return base_idx
+
+def flatten_base_pads(nz, base_idx, radius_cells=10):
+    """Flatten a disc at each base so buildings sit level.
+
+    Smoothstep blend at the rim. Radius 10 matches the resource clustering
+    radius and the pad radius the map-spec export documents. This also bakes
+    the fix for the rts 'base radius does not flatten terrain' gap into the
+    exported heightmap."""
+    out = nz.astype(np.float64).copy()
+    h, w = out.shape
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float64)
+    for b in np.unique(base_idx):
+        if int(b) < 0:
+            continue
+        ys, xs = np.where(base_idx == b)
+        if len(xs) == 0:
+            continue
+        cx, cy = float(xs.mean()), float(ys.mean())
+        base_h = float(out[int(round(cy)), int(round(cx))])
+        d = np.hypot(xx - cx, yy - cy) / float(radius_cells)
+        t = np.clip((1.0 - d) / 0.3, 0.0, 1.0)
+        t = t * t * (3.0 - 2.0 * t)
+        out = out * (1.0 - t) + base_h * t
+    return np.clip(out, 0.0, 1.0)
+
+def mirror_resources(resources, w):
+    """Mirror west (base 0) resource cells across the center column to give
+    the east base (base 1) a perfectly fair copy. resources: (base_id, x, y)."""
+    west = [(int(x), int(y)) for b, x, y in resources if int(b) == 0]
+    mirrored = [(0, x, y) for x, y in west]
+    mirrored += [(1, int(w - 1 - x), int(y)) for x, y in west]
+    return mirrored
+
 def _texture_grid(g, es):
     """Per-cell RGB texture (H x W x 3 uint8) the generator renders from.
 
@@ -1013,7 +1121,7 @@ def add_legend(im, es, g, base_idx=None, resources=None):
             d.text((im.width+16+30, y-2), "⛶ %d" % base_id, fill=(230,230,230))
     return out
 
-def f2_generate(jf, w, h, sc, oc, sd, ps, n_bases=1, n_res=2):
+def f2_generate(jf, w, h, sc, oc, sd, ps, n_bases=1, n_res=2, template="Freeform"):
     # Materials: reuse what is already loaded, otherwise read the upload.
     # NOTE: the JSON payload is *always* inspected when an upload is given,
     # so a `texture` carried by the JSON reaches the generator even when
@@ -1034,14 +1142,33 @@ def f2_generate(jf, w, h, sc, oc, sd, ps, n_bases=1, n_res=2):
     w = max(8, min(int(w), 512))
     h = max(8, min(int(h), 512))
     nz = pfield(w, h, float(sc), int(oc), int(sd))
+    key = _template_key(template)
 
-    # Base placement: low-freq noise, greedy spacing
-    base_field = pfield(w, h, float(sc) * 2.0, 3, int(sd))
-    g, base_idx = domap(nz, es, base_field=base_field, n_bases=n_bases, min_base_dist=30)
+    if key != "freeform":
+        # Layout template: shaped + mirrored height field, direct symmetric
+        # base slots. Templates are 1v1 by design; n_bases is informational.
+        nz = apply_template_height(nz, key, int(sd))
+        base_idx = place_bases_direct(w, h, template_base_cells(w, h, key))
+        g, _ = domap(nz, es, base_field=None, n_bases=0)  # materials only
+        n_bases = int((base_idx >= 0).sum())
+    else:
+        # Base placement: low-freq noise, greedy spacing
+        base_field = pfield(w, h, float(sc) * 2.0, 3, int(sd))
+        g, base_idx = domap(nz, es, base_field=base_field, n_bases=n_bases, min_base_dist=30)
+
+    # Flattened build pads at every base, in every mode (baked into the
+    # exported heightmap, so consumers get level build sites for free).
+    nz = flatten_base_pads(nz, base_idx, radius_cells=10)
 
     # Resources: high-freq noise, clustered on each base
     res_field = pfield(w, h, float(sc) * 5.0, 7, int(sd) + 77777)
-    resources = place_resources(base_idx, res_field, n_res)
+    if key != "freeform":
+        # Fairness by construction: cluster on the west half, mirror east.
+        west_idx = np.full(base_idx.shape, -1, dtype=np.int32)
+        west_idx[base_idx == 0] = 0
+        resources = mirror_resources(place_resources(west_idx, res_field, n_res), w)
+    else:
+        resources = place_resources(base_idx, res_field, n_res)
 
     # Texture the generator renders from (priority order):
     #  1. full per-cell "texture" carried by a generated_map_matrix.json upload
@@ -1098,11 +1225,11 @@ def f2_generate(jf, w, h, sc, oc, sd, ps, n_bases=1, n_res=2):
     parts = ["%s:%.1f pct" % (es[k].label, 100.0*cnt[k]/tot) for k in range(len(es))]
     base_str = ", ".join(["B%d:%d" % (b, (base_idx==b).sum()) for b in np.unique(base_idx) if b >= 0])
     res_str = ", ".join(["B%d:%d" % (b, sum(1 for r in resources if r[0]==b)) for b in np.unique(base_idx) if b >= 0])
-    st = "Seed=%s %dx%d | Bases: %s | Res: %s | " % (sd, w, h, base_str, res_str) + ", ".join(parts)
+    st = "Seed=%s %dx%d [%s] | Bases: %s | Res: %s | " % (sd, w, h, key, base_str, res_str) + ", ".join(parts)
     return np.array(im), st
 
-def f2_regen(jf, w, h, sc, oc, ps, nb=1, nr=2):
-    return f2_generate(jf, w, h, sc, oc, random.randint(0, 999999), ps, nb, nr)
+def f2_regen(jf, w, h, sc, oc, ps, nb=1, nr=2, template="Freeform"):
+    return f2_generate(jf, w, h, sc, oc, random.randint(0, 999999), ps, nb, nr, template)
 
 def f2_png():
     if GEN.get("grid") is None:
@@ -1646,6 +1773,8 @@ document.addEventListener('mouseleave', hide, true);
                     ps = gr.Slider(1, 16, value=4, step=1, label="Pixel scale")
                     nb = gr.Slider(1, 8, value=1, step=1, label="Bases count")
                     nr = gr.Slider(1, 4, value=2, step=1, label="Resources per base")
+                    tp = gr.Dropdown(choices=TEMPLATE_CHOICES, value="Freeform",
+                                     label="Layout template (templates are 1v1: symmetric bases/resources)")
                     with gr.Row():
                         gb = gr.Button("Generate", variant="primary")
                         rb = gr.Button("Regenerate")
@@ -1661,8 +1790,8 @@ document.addEventListener('mouseleave', hide, true);
                     with gr.Row():
                         reveal2 = gr.Button("📁 Open export folder")
             lb.click(lambda f: load_entries(f)[1], [jf], [mi])
-            gb.click(f2_generate, [jf, wi, hi, sc, oc, sd, ps, nb, nr], [mo, ss])
-            rb.click(f2_regen, [jf, wi, hi, sc, oc, ps, nb, nr], [mo, ss])
+            gb.click(f2_generate, [jf, wi, hi, sc, oc, sd, ps, nb, nr, tp], [mo, ss])
+            rb.click(f2_regen, [jf, wi, hi, sc, oc, ps, nb, nr, tp], [mo, ss])
             pb.click(f2_png, None, [po])
             mb.click(f2_mat, None, [mo2])
             reveal2.click(_reveal_exports, None, [mo2])
