@@ -1298,54 +1298,6 @@ def drawmap(g, es, ps, base_idx=None, resources=None, texture=None):
         im = im.resize((g.shape[1]*ps, g.shape[0]*ps), Image.NEAREST)
     return im
 
-def add_legend(im, es, g, base_idx=None, resources=None):
-    cnt = np.bincount(g.ravel(), minlength=len(es))
-    tot = cnt.sum()
-    # `bases` is defined unconditionally: the resource-row layout below uses
-    # len(bases), which used to NameError when base_idx was None.
-    bases = np.unique(base_idx) if base_idx is not None else np.array([-1])
-    base_ids = [int(b) for b in bases if b != -1]
-    res_rows = list((resources or [])[:8])  # legend shows at most 8
-    # Size the canvas to fit every drawn row (materials + base rows +
-    # resource rows + padding). The old height ignored base/resource rows and
-    # silently clipped them on small maps.
-    need = 40 + 28 * len(es)
-    if base_ids:
-        need = max(need, 40 + len(es) * 28 + 20 + max(base_ids) * 28 + 28)
-    if res_rows:
-        need = max(need, 40 + len(es) * 28 + 20 + len(bases) * 28 + 20
-                   + max(int(r[0]) for r in res_rows) * 28 + 28)
-    need += 12  # bottom padding
-    out = Image.new("RGB", (im.width+260, max(im.height, need)), (24,24,28))
-    out.paste(im, (0,0))
-    d = ImageDraw.Draw(out)
-    d.text((im.width+16, 10), "Legend", fill=(255,255,255))
-    for i, e in enumerate(es):
-        y = 40+i*28
-        try:
-            rgb = hex_rgb(e.color_hex)
-        except Exception:
-            rgb = (128,128,128)
-        d.rectangle([im.width+16, y, im.width+40, y+18], fill=rgb, outline=(255,255,255))
-        pct = 100.0*cnt[i]/max(tot,1)
-        d.text((im.width+48, y), "%s %.1f pct" % (e.label, pct), fill=(230,230,230))
-
-    # Base legend (PAL is BGR -> unpack to RGB for PIL)
-    for base_id in base_ids:
-        y = 40 + len(es)*28 + 20 + base_id*28
-        _b, _g, _r = PAL[base_id % len(PAL)]
-        d.rectangle([im.width+16, y, im.width+40, y+18], fill=(_r, _g, _b), outline=(255,255,255))
-        d.text((im.width+48, y), "Base %d" % base_id, fill=(230,230,230))
-    if res_rows:
-        for base_id, rx, ry in res_rows:
-            y = 40 + len(es)*28 + 20 + len(bases)*28 + 20 + base_id*28
-            # PAL is BGR -> unpack to RGB for PIL (hex_rgb takes a string,
-            # so passing the tuple always raised and fell back to gray)
-            _b, _g, _r = PAL[base_id % len(PAL)]
-            rgb = (_r, _g, _b)
-            d.ellipse([im.width+16+8, y+4, im.width+16+24, y+20], fill=(255,255,255), outline=rgb)
-            d.text((im.width+16+30, y-2), "⛶ %d" % base_id, fill=(230,230,230))
-    return out
 
 def f2_generate(jf, w, h, sc, oc, sd, ps, n_bases=1, n_res=2, template="Freeform",
                 warp=0.5, ridge=0.4, erosion=0.5):
@@ -1463,8 +1415,7 @@ def f2_generate(jf, w, h, sc, oc, sd, ps, n_bases=1, n_res=2, template="Freeform
     with _state_locked():
         GEN.update({"grid": g, "height": nz, "base_idx": base_idx, "resources": resources,
                     "seed": int(sd), "texture": texture})
-    im = add_legend(drawmap(g, es, int(ps), base_idx=base_idx, resources=resources, texture=texture), es, g,
-                    base_idx=base_idx, resources=resources)
+    im = drawmap(g, es, int(ps), base_idx=base_idx, resources=resources, texture=texture)
     cnt = np.bincount(g.ravel(), minlength=len(es))
     tot = cnt.sum()
     parts = ["%s:%.1f pct" % (es[k].label, 100.0*cnt[k]/tot) for k in range(len(es))]
@@ -1487,8 +1438,7 @@ def f2_png():
     base_idx = GEN.get("base_idx")
     resources = GEN.get("resources")
     texture = GEN.get("texture")
-    im = add_legend(drawmap(g, es, 8, base_idx=base_idx, resources=resources, texture=texture), es, g,
-                    base_idx=base_idx, resources=resources)
+    im = drawmap(g, es, 8, base_idx=base_idx, resources=resources, texture=texture)
     return _export_auto("procedural_map.png", lambda p: im.save(p), "Map PNG exported.")
 
 def f2_mat():
