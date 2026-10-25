@@ -1712,6 +1712,14 @@ def _kind_from_label(label):
             return kind
     return "neutral"
 
+# World-space height range declared in exported map specs. The height PNG
+# stays min-max normalized to [0, 1]; consumers (rts MapLoader) map the PNG
+# linearly onto [minHeight, maxHeight] and apply NO further scale in
+# explicit mode, so these must be real world units, not normalized ones.
+# 11 matches the height scale rts profiles already use (bowl-01 heightScale).
+EXPORT_MIN_HEIGHT = 0.0
+EXPORT_MAX_HEIGHT = 11.0
+
 def build_map_spec():
     """Build a map-spec dict (spec/map-spec.schema.json) from the last Feature 2 generation.
 
@@ -1746,12 +1754,11 @@ def build_map_spec():
         raise gr.Error("Generation has no usable height field. Regenerate the map.")
     if nz.shape != (h, w):
         raise gr.Error("Height field shape %s != grid shape (%d, %d). Regenerate." % (nz.shape, h, w))
-    # minHeight/maxHeight are normalized units: the PNG spans the data range
-    # [0, 1] and the consumer (game profile) multiplies by its own height
-    # scale. Honest because pfield() guarantees the [0, 1] normalization.
+    # The PNG stays normalized [0, 1] (pfield() guarantees it); the declared
+    # min/max are world units — see EXPORT_MIN_HEIGHT / EXPORT_MAX_HEIGHT.
     height_u16 = (np.clip(nz, 0.0, 1.0) * 65535.0 + 0.5).astype(np.uint16)
     heightfield = {"mode": "explicit", "png": height_fname,
-                   "minHeight": 0.0, "maxHeight": 1.0}
+                   "minHeight": EXPORT_MIN_HEIGHT, "maxHeight": EXPORT_MAX_HEIGHT}
     if w >= 16:  # schema requires resolution >= 16 when present; MAGER allows 8px grids
         heightfield["resolution"] = w
 
